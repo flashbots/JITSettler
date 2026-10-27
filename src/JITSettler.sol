@@ -30,7 +30,8 @@ contract JITSettler is IJITSettler {
 
     IPrioUpdateRegistry public immutable PUR;
     address public immutable ROUTER;
-    /// @notice The one mutable party: a Safe. Receives `postingChargeOut + feeOut`.
+    /// @notice `JITSettlerTreasury`, the one mutable party (hotkey-owned in v1). Receives
+    ///         `postingChargeOut + feeOut`.
     address public immutable TREASURY;
     /// @notice Fee on `routedGrossOut - postingChargeOut - simOriginalOut`, in bps, fixed at
     ///         construction: 0 in v1. Not posted per route, so no key can raise it; a change is a
