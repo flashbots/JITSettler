@@ -12,9 +12,10 @@ pragma solidity ^0.8.28;
 ///           routedEstGas 24
 ///         Amounts are 40-bit floats (`decodeAmount`): mantissa 32 | exponent 8, value =
 ///         mantissa << exponent. jit-router rounds `simOriginalOut` up (the floor only tightens),
-///         `postingChargeOut` down (the treasury only gets less) and `routedEstOut` down (`peek`
-///         never overstates). The two estimates feed only `peek`, the `maxGas` refusal and
-///         `Settled`, never the floor or the treasury's share. Nothing price-like is posted.
+///         `postingChargeOut` down (the treasury only gets less) and `routedEstOut` down (the
+///         estimate never overstates). `routedEstOut` feeds only the no-route check (0 = no route)
+///         and `Settled`; `routedEstGas` feeds only the `maxGas` refusal and `Settled`. Neither
+///         feeds the floor or the treasury's share. Nothing price-like is posted.
 ///         No `feeBps` field: `JITSettler`'s `FEE_BPS` is a constructor-fixed immutable (0 in v1).
 ///         No `Router` field: `JITSettler`'s `Router` is immutable and PUR lanes are per target.
 ///         No fingerprint: a request reads whatever route its lane holds this block.
@@ -105,7 +106,7 @@ library RouteCodec {
 
     /// @notice Header fields, or `ok == false` when the lane is too short, not this version, or
     ///         an amount's exponent exceeds `MAX_EXPONENT`.
-    ///         Never reverts: `peek` is a view that must answer 0, not throw.
+    ///         Never reverts: a lane that does not decode is "no route" (`NoRoute`), not a panic.
     function tryDecodeHeader(uint256[] memory slots)
         internal
         pure
