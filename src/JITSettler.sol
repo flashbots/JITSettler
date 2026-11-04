@@ -59,8 +59,7 @@ contract JITSettler is IJITSettler {
         }
     }
 
-    /// @param updater The key that signs lanes: the existing updater (production
-    ///        `0x7BC9141D498e1506B2C5d4C9A661bF7EB28d4B88`; staging its own), held by the
+    /// @param updater The key that signs lanes, one per environment, held by the
     ///        builder. The builder's relay EOA posts each signed lane in its own update tx,
     ///        immediately before the routed order it serves, as a one-entry PUR
     ///        `batchUpdateStateWithSignature`, and needs no registration. PUR scopes updaters to
