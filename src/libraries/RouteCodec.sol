@@ -13,8 +13,8 @@ pragma solidity ^0.8.28;
 ///         Amounts are 40-bit floats (`decodeAmount`): mantissa 32 | exponent 8, value =
 ///         mantissa << exponent. jit-router rounds `simOriginalOut` up (the floor only tightens),
 ///         `postingChargeOut` down (the treasury only gets less) and `routedEstOut` down (the
-///         estimate never overstates). `routedEstOut` feeds only the no-route check (0 = no route)
-///         and `Settled`; `routedEstGas` feeds only the `maxGas` refusal and `Settled`. Neither
+///         estimate never overstates). `routedEstOut` feeds `peek`, the no-route check (0 = no route)
+///         and `Settled`; `routedEstGas` feeds `peek`, the `maxGas` refusal and `Settled`. Neither
 ///         feeds the floor or the treasury's share. Nothing price-like is posted.
 ///         No `feeBps` field: `JITSettler`'s `FEE_BPS` is a constructor-fixed immutable (0 in v1).
 ///         No `Router` field: `JITSettler`'s `Router` is immutable and PUR lanes are per target.
