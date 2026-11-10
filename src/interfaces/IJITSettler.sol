@@ -45,4 +45,9 @@ interface IJITSettler {
     function laneFor(address caller, Request calldata req) external pure returns (uint256 lane);
 
     function swap(Request calldata req) external returns (uint256 routedOut);
+
+    function peek(Request calldata req)
+        external
+        view
+        returns (uint256 routedEstOut, uint256 routedEstGas);
 }
