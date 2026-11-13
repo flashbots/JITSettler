@@ -17,7 +17,7 @@ import { SafeERC20Min } from "./libraries/SafeERC20Min.sol";
 ///         Fully immutable: its `Router`, PUR, treasury, `FEE_BPS` and updater are constructor
 ///         arguments, with no owner, pin, timelock or pause. An upgrade is a new `JITSettler` +
 ///         `Router` pair that integrators repoint to. The kill switch is the builder: with no
-///         lane posted, `swap` reverts `NoRoute`, and the caller falls back.
+///         lane posted, `peek` answers 0 and `swap` reverts `NoRoute`, and the caller falls back.
 ///
 ///         Fund flow: `tokenIn` goes from `msg.sender` straight to the `Router` (one
 ///         `transferFrom`); the `Router` pays its output here (`routedGrossOut`, measured); this
@@ -86,6 +86,24 @@ contract JITSettler is IJITSettler {
     /// @inheritdoc IJITSettler
     function laneFor(address caller, Request calldata req) external pure returns (uint256 lane) {
         return RouteCodec.laneIndex(_key(caller, req));
+    }
+
+    /// @inheritdoc IJITSettler
+    /// @dev RFC: a view of the posted header. `routedEstOut` (net of `postingChargeOut` and
+    ///      `feeOut`) is 0 when `req`'s lane holds no route posted for this block, or when
+    ///      `maxGas != 0` and `routedEstGas > maxGas`. Neither estimate moves `swap`'s floor or
+    ///      split. Optimistic: a non-zero `peek` can still precede a reverting `swap`. Keyed on
+    ///      `msg.sender`, so an off-chain quote must be an `eth_call` from the address that will
+    ///      call `swap`.
+    function peek(Request calldata req)
+        external
+        view
+        returns (uint256 routedEstOut, uint256 routedEstGas)
+    {
+        (bool ok, RouteCodec.Header memory h,) = _lookup(msg.sender, req);
+        if (!ok) return (0, 0);
+        routedEstGas = h.routedEstGas;
+        routedEstOut = (req.maxGas != 0 && routedEstGas > req.maxGas) ? 0 : h.routedEstOut;
     }
 
     /// @inheritdoc IJITSettler
