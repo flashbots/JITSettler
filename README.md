@@ -68,13 +68,13 @@ settler.reportDefault(req, out)            // or emit JITDefaultV1 from the call
 
 With no route posted, this costs one `peek` and never calls `swap`.
 
-**Flow B: conservative.** The caller first measures what its default route would give, then
-branches on `peek`. A JIT fill must beat that measured output.
+**Flow B: conservative.** When `peek` shows a trusted route, the caller first measures what its
+default route would give, and a JIT fill must beat that.
 
 ```
-dOut = trial { runDefault(defaultRoute); measure; revert }   // the default's output now
 s = settler.peek(req)
 if s != 0 and s in trustedSetters:
+    dOut = trial { runDefault(defaultRoute); measure; revert }   // the default's output now
     try this.jitSwap(req, dOut) -> out:     // swap(req), then require(out > dOut);
         done                                // any revert undoes the swap
     catch:
@@ -85,7 +85,8 @@ settler.reportDefault(req, out)
 ```
 
 The comparison with `dOut` happens in the caller after `swap`, so the settler's arguments stay
-fixed. With no route posted, flow B costs the trial of the default plus one `peek`.
+fixed. With no route posted, flow B costs one `peek`, the same as flow A; the trial of the
+default runs only when a trusted route is live.
 
 ### Builders and executors
 
