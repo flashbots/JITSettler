@@ -4,6 +4,10 @@ A settler for just-in-time (JIT) routes. A block builder posts a route for a swa
 right before the swap, in the same block. The aggregator's swap then fills through that route, or
 falls back to the aggregator's own default route.
 
+The intention is that a builder integrates many routers and, for each swap, posts the best route
+any of them provides. The route names its executor, so the settler runs any router's route and
+adding a router needs no change to the settler.
+
 Designed by Flashbots in collaboration with [Gattaca](https://github.com/gattaca-com). The design
 starts from Gattaca's proof of concept,
 [gattaca-com/jit-settler-poc](https://github.com/gattaca-com/jit-settler-poc).
