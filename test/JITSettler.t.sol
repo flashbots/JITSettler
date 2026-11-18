@@ -4,7 +4,7 @@ pragma solidity ^0.8.28;
 import { Test } from "forge-std/Test.sol";
 import { JITSettler, Sandbox, IJITEvents } from "../src/JITSettler.sol";
 
-// Gas limit the tests pass to `peek`/`swap` and apply with `swap{gas: G}`.
+// Gas limit the tests pass to `peek` and `swap`.
 uint256 constant G = 1_000_000;
 
 contract MockToken {
@@ -59,6 +59,13 @@ contract FeeExecutor {
     }
 }
 
+/// Spends all the gas it is given.
+contract GasBurner {
+    function burn() external pure {
+        while (true) { }
+    }
+}
+
 /// Flow A caller (efficient): peek(req), trusted setter -> swap; otherwise the default route,
 /// which emits JITDefaultV1. The default route is simulated by minting `defaultOut`.
 contract FlowACaller is IJITEvents {
@@ -82,7 +89,7 @@ contract FlowACaller is IJITEvents {
         address s =
             settler.peek(address(tokenIn), amountIn, address(tokenOut), minOut, recipient, G);
         if (s != address(0) && trusted[s]) {
-            try settler.swap{ gas: G }(
+            try settler.swap(
                 address(tokenIn), amountIn, address(tokenOut), minOut, recipient, G
             ) returns (
                 uint256 o
@@ -134,24 +141,32 @@ contract JITSettlerTest is Test, IJITEvents {
         assertEq(settler.peek(address(tIn), 1e18, address(tOut), 1, recipient, G), address(0));
         vm.prank(user);
         vm.expectRevert(JITSettler.NoRoute.selector);
-        settler.swap{ gas: G }(address(tIn), 1e18, address(tOut), 1, recipient, G);
+        settler.swap(address(tIn), 1e18, address(tOut), 1, recipient, G);
     }
 
-    /// A call that does not apply its gas limit reverts, so the caller falls back.
-    function test_swap_withoutGasCap_reverts() public {
-        _post(110e18, 105e18);
+    /// An executor gets at most `gasLimit`: one that burns all its gas reverts the swap, and the
+    /// caller keeps the rest of its gas. The route stays live.
+    function test_swap_capsExecutorGas() public {
+        GasBurner burner = new GasBurner();
+        vm.prank(builder);
+        settler.setRoute(address(burner), abi.encodeCall(GasBurner.burn, ()));
+        uint256 before = gasleft();
         vm.prank(user);
-        vm.expectRevert(abi.encodeWithSelector(JITSettler.GasNotCapped.selector, G));
-        settler.swap{ gas: G + 50_000 }(address(tIn), 1e18, address(tOut), 100e18, recipient, G);
+        try settler.swap(address(tIn), 1e18, address(tOut), 1, recipient, 100_000) {
+            fail();
+        } catch { }
+        assertLt(before - gasleft(), 250_000);
+        assertEq(settler.peek(address(tIn), 1e18, address(tOut), 1, recipient, G), builder);
     }
 
-    /// A route that needs more gas than the limit reverts inside the cap; the caller keeps the rest.
-    function test_swap_routeOverGasLimit_reverts() public {
+    /// A call with more gas than `gasLimit` is fine.
+    function test_swap_moreGasThanLimit_fills() public {
         _post(110e18, 105e18);
         vm.prank(user);
-        vm.expectRevert();
-        settler.swap{ gas: 30_000 }(address(tIn), 1e18, address(tOut), 100e18, recipient, 30_000);
-        assertEq(settler.peek(address(tIn), 1e18, address(tOut), 100e18, recipient, G), builder);
+        uint256 out = settler.swap{ gas: 5_000_000 }(
+            address(tIn), 1e18, address(tOut), 100e18, recipient, 500_000
+        );
+        assertEq(out, 105e18);
     }
 
     function test_routedFill_paysBuilderFee_emits() public {
@@ -161,9 +176,7 @@ contract JITSettlerTest is Test, IJITEvents {
         vm.expectEmit(true, true, true, true, address(settler));
         emit JITRoutedV1(recipient, address(tIn), address(tOut), 1e18, 100e18, 105e18);
         vm.prank(user);
-        uint256 out = settler.swap{ gas: G }(
-            address(tIn), 1e18, address(tOut), 100e18, recipient, G
-        );
+        uint256 out = settler.swap(address(tIn), 1e18, address(tOut), 100e18, recipient, G);
 
         assertEq(out, 105e18);
         assertEq(tOut.balanceOf(builder), 5e18); // the builder's cut, taken in the executor
@@ -176,7 +189,7 @@ contract JITSettlerTest is Test, IJITEvents {
         vm.expectRevert(
             abi.encodeWithSelector(JITSettler.InsufficientOutput.selector, 99e18, 100e18)
         );
-        settler.swap{ gas: G }(address(tIn), 1e18, address(tOut), 100e18, recipient, G);
+        settler.swap(address(tIn), 1e18, address(tOut), 100e18, recipient, G);
         // The revert undid the consumption.
         assertEq(settler.peek(address(tIn), 1e18, address(tOut), 100e18, recipient, G), builder);
     }
@@ -184,11 +197,11 @@ contract JITSettlerTest is Test, IJITEvents {
     function test_routeIsSingleUse() public {
         _post(110e18, 105e18);
         vm.prank(user);
-        settler.swap{ gas: G }(address(tIn), 1e18, address(tOut), 100e18, recipient, G);
+        settler.swap(address(tIn), 1e18, address(tOut), 100e18, recipient, G);
         assertEq(settler.peek(address(tIn), 1e18, address(tOut), 100e18, recipient, G), address(0));
         vm.prank(user);
         vm.expectRevert(JITSettler.NoRoute.selector);
-        settler.swap{ gas: G }(address(tIn), 1e18, address(tOut), 100e18, recipient, G);
+        settler.swap(address(tIn), 1e18, address(tOut), 100e18, recipient, G);
     }
 
     function test_routeExpiresNextBlock() public {
@@ -211,9 +224,7 @@ contract JITSettlerTest is Test, IJITEvents {
         vm.prank(builder);
         settler.setRoute(address(exec), _data(110e18, 105e18, sig));
         vm.prank(user);
-        uint256 out = settler.swap{ gas: G }(
-            address(tIn), 1e18, address(tOut), 100e18, recipient, G
-        );
+        uint256 out = settler.swap(address(tIn), 1e18, address(tOut), 100e18, recipient, G);
         assertEq(out, 105e18);
     }
 
@@ -231,7 +242,7 @@ contract JITSettlerTest is Test, IJITEvents {
         );
         vm.prank(user);
         vm.expectRevert(); // allowance[victim][sandbox] == 0
-        settler.swap{ gas: G }(address(tIn), 1e18, address(tOut), 0, recipient, G);
+        settler.swap(address(tIn), 1e18, address(tOut), 0, recipient, G);
         assertEq(tIn.balanceOf(victim), 50e18);
     }
 
@@ -247,9 +258,7 @@ contract JITSettlerTest is Test, IJITEvents {
 
         // No route: the default runs and JITDefaultV1 reports its output.
         vm.expectEmit(true, true, true, true, address(settler));
-        emit JITDefaultV1(
-            recipient, address(tIn), address(tOut), 1e18, 100e18, 101e18, address(agg)
-        );
+        emit JITDefaultV1(recipient, address(tIn), address(tOut), 1e18, 100e18, 101e18);
         (uint256 out, bool routed) = agg.run(tIn, 1e18, tOut, 100e18, recipient, 101e18);
         assertEq(out, 101e18);
         assertFalse(routed);

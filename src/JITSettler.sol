@@ -5,7 +5,6 @@ import { IERC20 } from "./IERC20.sol";
 
 /// @notice Events of the JIT settler standard. The settler emits `JITRoutedV1` on a fill and
 ///         `JITDefaultV1` when a caller reports its own default route through `reportDefault`.
-///         A caller may instead emit `JITDefaultV1` from its own contract.
 interface IJITEvents {
     /// @notice Emitted by the settler when a swap fills through a posted route.
     event JITRoutedV1(
@@ -18,18 +17,14 @@ interface IJITEvents {
     );
 
     /// @notice A caller ran its own default route instead of a JIT route. `amountOut` is what the
-    ///         recipient received from that route. `reporter` is the contract that reported it.
-    ///         Anyone can report and anyone can emit this event, so trust a log only if the
-    ///         settler emitted it and `reporter` is a known caller, or the known caller emitted
-    ///         it itself (log address == `reporter`). The amounts are the reporter's claim.
+    ///         recipient received from that route, as the caller reports it.
     event JITDefaultV1(
         address indexed recipient,
         address indexed tokenIn,
         address indexed tokenOut,
         uint256 amountIn,
         uint256 amountOutMin,
-        uint256 amountOut,
-        address reporter
+        uint256 amountOut
     );
 }
 
@@ -55,7 +50,6 @@ contract JITSettler is IJITEvents {
     error NoRoute();
     error TransferFailed();
     error InsufficientOutput(uint256 amountOut, uint256 amountOutMin);
-    error GasNotCapped(uint256 gasLimit);
 
     /// @notice Posts the route for this block. The setter is msg.sender. A builder can post
     ///         through its own contract, so it can rotate keys without callers changing the
@@ -86,9 +80,8 @@ contract JITSettler is IJITEvents {
         if (_isLive(header)) return header.setter;
     }
 
-    /// @param gasLimit The most gas this call may have. The caller calls `swap{gas: gasLimit}`,
-    ///        so a route cannot use up the gas the caller needs for its default route; a call
-    ///        that arrives with more gas reverts. Builders fit routes under it.
+    /// @param gasLimit The most gas the route's executor gets, so a route cannot use up the gas
+    ///        the caller needs for its default route. Builders fit routes under it.
     /// @return amountOut What `recipient` received.
     function swap(
         address tokenIn,
@@ -98,7 +91,6 @@ contract JITSettler is IJITEvents {
         address recipient,
         uint256 gasLimit
     ) external returns (uint256 amountOut) {
-        if (gasleft() > gasLimit) revert GasNotCapped(gasLimit);
         RouteHeader storage stored = _routeHeader;
         if (!_isLive(stored)) revert NoRoute();
         // Consume and load before any external call, so a reentrant swap or setRoute can't touch
@@ -109,7 +101,7 @@ contract JITSettler is IJITEvents {
 
         _transferFrom(tokenIn, msg.sender, header.executor, amountIn);
         uint256 balanceBefore = IERC20(tokenOut).balanceOf(recipient);
-        SANDBOX.run(header.executor, data);
+        SANDBOX.run{ gas: gasLimit }(header.executor, data);
         uint256 balanceAfter = IERC20(tokenOut).balanceOf(recipient);
         amountOut = balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0;
         if (amountOut < amountOutMin) revert InsufficientOutput(amountOut, amountOutMin);
@@ -126,9 +118,7 @@ contract JITSettler is IJITEvents {
         address recipient,
         uint256 amountOut
     ) external {
-        emit JITDefaultV1(
-            recipient, tokenIn, tokenOut, amountIn, amountOutMin, amountOut, msg.sender
-        );
+        emit JITDefaultV1(recipient, tokenIn, tokenOut, amountIn, amountOutMin, amountOut);
     }
 
     function _isLive(RouteHeader storage header) private view returns (bool) {
