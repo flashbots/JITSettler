@@ -12,7 +12,8 @@ Designed by Flashbots in collaboration with [Gattaca](https://github.com/gattaca
 starts from Gattaca's proof of concept,
 [gattaca-com/jit-settler-poc](https://github.com/gattaca-com/jit-settler-poc).
 
-**Status:** not audited and not deployed. The settler in use today is v1.3.0, kept under
+**Status:** not audited and not deployed. The previous version, v1.3.0, is deployed on mainnet at
+`0xd43F34Dd4fcEd2829eFfaC16064B436B98d23CF7` and kept under
 [`reference/v1.3.0`](reference/v1.3.0) (see [History](#history)).
 
 ## How it works
@@ -23,29 +24,38 @@ starts from Gattaca's proof of concept,
 |---|---|---|
 | `setRoute(executor, data)` | builder | Stores the route for this block. The setter is `msg.sender`. A later post overwrites an earlier one. |
 | `peek(tokenIn, amountIn, tokenOut, amountOutMin, recipient)` | caller | Returns the setter of the route that is live in this block, or 0. The arguments are not used on chain; they let a builder read the request when it simulates the swap before any route is posted. |
-| `swap(tokenIn, amountIn, tokenOut, amountOutMin, recipient)` | caller | Runs the live route and returns `amountOut`. Reverts if there is no route or the output is too low. A revert means "fall back". |
+| `swap(tokenIn, amountIn, tokenOut, amountOutMin, recipient)` | caller | Runs the live route and returns `amountOut`. Reverts if there is no route, the transfer or the executor fails, or the output is too low. A revert means "fall back". |
 | `reportDefault(tokenIn, amountIn, tokenOut, amountOutMin, recipient, amountOut)` | caller | Emits `JITDefaultV1` when the caller ran its own default route. Changes no state. |
 
 `swap`:
 
 1. Requires a route posted in this block, and marks it used before any external call.
-2. Pulls exactly `amountIn` of `tokenIn` from `msg.sender` to the route's executor.
+2. Transfers `amountIn` of `tokenIn` from `msg.sender` to the route's executor.
 3. Calls the executor with the posted data, through the sandbox.
 4. Requires that `recipient`'s `tokenOut` balance grew by at least `amountOutMin`.
 5. Emits `JITRoutedV1`.
 
 ### What a caller can rely on
 
-- The settler moves only `amountIn` of `tokenIn`, and only from `msg.sender`.
-- The recipient gets at least `amountOutMin`, or the swap reverts.
-- The executor is called by the sandbox, which holds no approvals. An executor set to a token
-  contract cannot spend what callers approved to the settler.
-- A route is used once, and only in the block it was posted.
+- The settler makes one transfer of `amountIn` of `tokenIn`, from `msg.sender`. With a token that
+  charges fees on transfer, the executor receives less.
+- The recipient's `tokenOut` balance grows by at least `amountOutMin`, or the swap reverts.
+- The executor is called by the sandbox, not the settler, so a route cannot spend what callers
+  approved to the settler, even by naming a token as the executor. Approve the settler, never
+  the sandbox.
+- A post allows at most one successful swap, and only in the block it was posted. A swap that
+  reverts leaves the route live.
 - Nobody can post as someone else: the setter is always `msg.sender` of `setRoute`.
 
 Anyone can post a route. A caller that cares who posted it checks the setter that `peek` returns
 against its own list. Whether a route beats the caller's default is the setter's promise, unless
 the caller compares the two itself.
+
+The executor is whatever code the setter chose, and it runs inside the caller's transaction. The
+sandbox keeps it from spending approvals given to the settler, nothing more. It can call back
+into the caller's contract, any contract that authorises by `tx.origin` sees the user, and it
+can use up the gas it is given. A caller that runs routes from setters it does not trust must be
+safe against all three.
 
 ### Integrating as a caller
 
@@ -57,7 +67,7 @@ Both flows below use the same fixed calldata: `req`, `trustedSetters` and `defau
 ```
 s = settler.peek(req)                       // setter, or 0
 if s != 0 and s in trustedSetters:
-    try settler.swap(req) -> out:
+    try settler.swap{gas: jitGasLimit}(req) -> out:
         done
     catch:
         // fall through to the default
@@ -75,8 +85,10 @@ default route would give, and a JIT fill must beat that.
 s = settler.peek(req)
 if s != 0 and s in trustedSetters:
     dOut = trial { runDefault(defaultRoute); measure; revert }   // the default's output now
-    try this.jitSwap(req, dOut) -> out:     // swap(req), then require(out > dOut);
-        done                                // any revert undoes the swap
+    // jitSwap: swap(req), then require(out > dOut). Any revert undoes the swap.
+    // It accepts calls only from the caller's own contract.
+    try this.jitSwap{gas: jitGasLimit}(req, dOut) -> out:
+        done
     catch:
         // fall through to the default
 out = runDefault(defaultRoute)
@@ -87,6 +99,52 @@ settler.reportDefault(req, out)
 The comparison with `dOut` happens in the caller after `swap`, so the settler's arguments stay
 fixed. With no route posted, flow B costs one `peek`, the same as flow A; the trial of the
 default runs only when a trusted route is live.
+
+### Caller requirements
+
+A builder can only route a caller's swaps if the caller keeps to these.
+
+1. **Static request.** `tokenIn`, `amountIn`, `tokenOut`, `amountOutMin` and `recipient` are fixed
+   when the user signs. They must not depend on state that the builder's post or earlier
+   transactions change (for example "my whole balance"), or a route built for one request meets
+   another and reverts.
+2. **Visible without a route.** In a simulation with no route posted, the transaction calls `peek`
+   or `swap`, or emits `JITDefaultV1`, with the request. That is how a builder finds the order.
+3. **Report the default.** Whenever the default route runs, the caller emits `JITDefaultV1`, through
+   `reportDefault` or from its own contract. Its `amountOut` is the benchmark a route must beat.
+   Report only when the default actually ran, once per request.
+4. **One request everywhere.** `peek`, `swap` and the report carry the same five fields, so the
+   builder can match them.
+5. **Measure the default like a fill.** `amountOut` in the report is the growth of `recipient`'s
+   `tokenOut` balance, as `swap` measures it, so the two outputs compare.
+6. **A JIT revert never fails the order.** Call `swap` in `try`/`catch` with a gas limit, and fall
+   back on any revert. A route that was overwritten or went stale then costs a fall-back, not the
+   user's transaction, and the limit leaves enough gas for the default route and the report.
+7. **Funded and approved.** When it calls `swap`, `msg.sender` holds `amountIn` of `tokenIn` and
+   has approved the settler for it.
+8. **ERC-20 tokens.** The settler moves `tokenIn` with `transferFrom` and measures `tokenOut` with
+   `balanceOf`. Wrap or unwrap native ETH outside the JIT path.
+9. **Check setters.** Keep a list of setters you trust and compare `peek`'s result against it.
+   Without that check, flow A runs anyone's route: whoever sees the transaction, for example in a
+   public mempool, can post a route just before it that pays exactly `amountOutMin` and keep the
+   difference. A caller that cannot keep a list can still run flow B's comparison for any live
+   route, so a route has to beat the measured default. It then pays for that trial whenever
+   anyone posts a route, and the warnings above about the executor's code apply in full.
+
+### Builder behaviour
+
+At a high level, a builder:
+
+1. simulates the order with no route posted, finds the `peek` or `swap` call or the `JITDefaultV1`
+   event, and reads the request from it and the default's output from `JITDefaultV1`;
+2. asks its routers for routes for that request, and keeps the best one that beats the default
+   after the builder's fee;
+3. posts it with `setRoute`, immediately before the order, from a setter the caller trusts;
+4. simulates the post and the order together, and keeps the post only if the order calls `swap`,
+   the fill succeeds and the recipient gets more than the default. Otherwise it drops the post
+   and the order runs its default.
+
+Nothing between the post and the order calls `swap`.
 
 ### Builders and executors
 
@@ -116,11 +174,42 @@ Anyone can call `reportDefault`, and anyone can emit `JITDefaultV1`. Trust a `JI
 only if the settler emitted it and `reporter` is a caller you know, or that caller emitted it
 itself. Its amounts are the reporter's claim.
 
+## Design choices
+
+- **One route slot, and the last post wins.** The builder posts right before each order and
+  controls the order of its block, so routes need no per-request keys, and one slot is the
+  cheapest storage. Every post overwrites the last, so this relies on each post sitting directly
+  before its order. A post that lands in between, for example a third party's, makes the order
+  see another setter or an overwritten route, and a caller that checks setters falls back.
+- **No binding between a route and a request.** A builder posts only when its simulation shows the
+  order reading the route and succeeding. Setter checks cover anyone else's post. A route that
+  does not fit the request either reverts, so the caller falls back, or still pays the recipient
+  at least `amountOutMin`.
+- **No owner, no upgrade.** Nobody can change what the settler does with callers' approvals. A new
+  router is a new executor named in a route, never a new settler.
+- **Fees inside the executor.** Each builder sets its own terms and checks them in its own
+  simulation. The settler has no fee logic to keep in step with builders.
+- **Opaque route data and any executor.** Any router's format works, so one settler serves many
+  routers and many builders.
+- **A sandbox, not a fixed function selector.** Calling an arbitrary executor from the contract
+  that holds callers' approvals would let a route spend them, for example by naming a token as the
+  executor. A fixed function selector would also prevent that, short of a selector collision, but
+  would limit executors to one function. The sandbox costs about 3.4k per routed swap
+  and lets a route call any function.
+- **The floor is `amountOutMin` only.** The settler cannot know what the default would have paid.
+  A caller that wants that floor measures it itself (flow B).
+- **`peek` takes the request.** In the builder's first simulation no route is posted, so a caller
+  that branches on `peek` never calls `swap`. The request has to be visible in the `peek` call.
+
 ## Gas
 
 Measured on a mainnet fork at block 26,410,000: 1 WETH to USDC through the Uniswap V3 5 bps pool,
-the same executor code and compiler settings for each settler, each call in its own transaction.
-Figures are the gas of the call, without the 21,000 base cost and calldata.
+each call in its own transaction. Figures are the gas of the call, without the 21,000 base cost
+and calldata. v1.3.0 is the deployed settler and router. The PoC and JITSettler run the same
+router logic and compiler settings, adapted to the sandbox and paying the recipient directly,
+so the v1.3.0 column compares whole designs, not settler overhead alone. A v1.3.0 post is a
+signed update of two words to the `PrioUpdateRegistry`; a JITSettler post stores the executor's
+call data.
 
 | Measurement | v1.3.0 | Gattaca PoC | JITSettler |
 |---|---|---|---|
