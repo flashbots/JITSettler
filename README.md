@@ -46,6 +46,9 @@ the caller compares the two itself.
 ### Integrating as a caller
 
 The swap parameters are fixed when the user signs. The caller may branch on what `peek` returns.
+Both flows below use the same fixed calldata: `req`, `trustedSetters` and `defaultRoute`.
+
+**Flow A: efficient.** The caller trusts the setter to post only a route that beats its default.
 
 ```
 s = settler.peek(req)                       // setter, or 0
@@ -61,7 +64,24 @@ settler.reportDefault(req, out)            // or emit JITDefaultV1 from the call
 
 With no route posted, this costs one `peek` and never calls `swap`.
 
-A more conservative caller can run both paths as trials, revert them, and take the better one.
+**Flow B: conservative.** The caller first measures what its default route would give, then
+branches on `peek`. A JIT fill must beat that measured output.
+
+```
+dOut = trial { runDefault(defaultRoute); measure; revert }   // the default's output now
+s = settler.peek(req)
+if s != 0 and s in trustedSetters:
+    try this.jitSwap(req, dOut) -> out:     // swap(req), then require(out > dOut);
+        done                                // any revert undoes the swap
+    catch:
+        // fall through to the default
+out = runDefault(defaultRoute)
+require(out >= userMinOut)
+settler.reportDefault(req, out)
+```
+
+The comparison with `dOut` happens in the caller after `swap`, so the settler's arguments stay
+fixed. With no route posted, flow B costs the trial of the default plus one `peek`.
 
 ### Builders and executors
 
