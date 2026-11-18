@@ -27,7 +27,7 @@ from Gattaca's proof of concept,
 | `reportDefault(tokenIn, amountIn, tokenOut, amountOutMin, recipient, amountOut)` | aggregator | Emits `JITDefaultV1` after the aggregator ran its default route. Changes no state. |
 
 Below, `req` is the six arguments of `peek` and `swap`. `gasLimit` is the most gas the route's
-executor may use.
+executor may use. It gets less if `swap` itself runs short of gas.
 
 `swap`:
 
@@ -52,8 +52,9 @@ Anyone can post a route. Whether it beats the caller's default is up to the sett
 caller checks.
 
 The executor is code the setter chose, running inside the caller's transaction. It can call back
-into the caller's contract, so the caller needs a re-entry guard. It can also use all the gas it
-gets, which `gasLimit` bounds. Both flows below show the guard.
+into the caller's contract, so every external function of the caller that changes state or moves
+tokens needs a re-entry guard. It can also use all the gas it gets, which `gasLimit` bounds. Both
+flows below show the guard.
 
 ### Integrating as a caller
 
@@ -85,15 +86,22 @@ default would pay, and the JIT fill must beat it.
 function execute(req, trustedSetters, defaultRoute) nonReentrant:
     s = settler.peek(req)
     if s != 0 and s in trustedSetters:
-        dOut = trial { runDefault(defaultRoute); measure; revert }   // the default's output now
-        try this.jitSwap(req, dOut) -> out:
-            return out
-        catch:
-            // fall through to the default
+        try this.trialDefault(defaultRoute):     // always reverts
+        catch (bytes err):
+            if err is Measured(dOut):            // the default's output on the current state
+                try this.jitSwap(req, dOut) -> out:
+                    return out
+                catch:
+                    // fall through to the default
     out = runDefault(defaultRoute)
     require(out >= userMinOut)
     settler.reportDefault(req, out)
     return out
+
+// Runs the default and reverts with its output, so it changes no state.
+function trialDefault(defaultRoute):
+    require(msg.sender == address(this))
+    revert Measured(runDefault(defaultRoute))
 
 // External so that try/catch can undo the swap if it does not beat dOut.
 function jitSwap(req, dOut):
@@ -103,9 +111,9 @@ function jitSwap(req, dOut):
     return out
 ```
 
-The caller compares with `dOut` after `swap`, so the settler's arguments stay fixed. `jitSwap` is
-called by `execute` on the same contract, so it has no re-entry guard; its sender check keeps
-everyone else out. With no route posted, flow B also costs one `peek`. It runs the trial only when
+The caller compares with `dOut` after `swap`, so the settler's arguments stay fixed. `execute`
+calls `trialDefault` and `jitSwap` on the same contract, so they have no re-entry guard; their
+sender checks keep everyone else out. With no route posted, flow B also costs one `peek`. It runs the trial only when
 a trusted route is live.
 
 ### Caller requirements
@@ -126,7 +134,12 @@ A builder can only route a caller's swaps if the caller follows these rules.
    `swap` measures it, so the two outputs compare.
 6. **Never fail the order on a JIT revert.** Call `swap` in `try`/`catch` and fall back on any
    revert. A route that was replaced, went stale or ran out of gas then costs a fall-back, not the
-   user's transaction. Set `gasLimit` low enough to leave gas for the default route and the report.
+   user's transaction. `gasLimit` is an upper bound: if `swap` gets too little gas, the executor
+   gets less than `gasLimit` and the route may fail. Before calling `swap`, make sure the
+   transaction has gas for `gasLimit`, the settler's transfer and checks, the default route and
+   the report. If it does not, skip the JIT attempt. Loading the route's data is outside
+   `gasLimit` and costs about 2.1k gas per 32 bytes; the setter decides its size, which is one
+   more reason to check setters.
 7. **Funded and approved.** When it calls `swap`, `msg.sender` holds `amountIn` of `tokenIn` and
    has approved the settler for it.
 8. **ERC-20 tokens only.** The settler uses `transferFrom` and `balanceOf`. Wrap or unwrap native
@@ -181,7 +194,9 @@ builder is a good proxy for the setter, and the executor is in the post just bef
 - **One route slot, last post wins.** The builder posts directly before each order and controls the
   order of its block, so routes need no per-request keys. One slot is also the cheapest storage.
   This relies on each post sitting directly before its order. If another post lands in between,
-  the order sees a different setter, and a caller that checks setters falls back.
+  the order reads that route. From a different setter, a caller that checks setters falls back.
+  From the same setter, the replacement still has to pay at least `amountOutMin`, and in flow B
+  beat the default.
 - **No link between a route and a request.** A builder posts only when its simulation shows the
   order reading the route and succeeding. Setter checks cover anyone else's post. A route that does
   not fit the request either reverts, so the caller falls back, or still pays at least
@@ -197,8 +212,9 @@ builder is a good proxy for the setter, and the executor is in the post just bef
   executor. A fixed selector would also stop that, barring a selector collision, but would limit
   executors to one function. The sandbox costs about 3.4k gas per routed swap.
 - **`gasLimit` in the request.** The route's code could use up the gas the caller needs for its
-  default. The settler gives the executor at most `gasLimit`, so the caller does not have to cap
-  the call itself, and builders see the limit in `peek` before they post.
+  default. The settler gives the executor at most `gasLimit`, so the route's code cannot take more
+  without the caller capping the call itself. Requirement 6 covers the rest of a JIT attempt's
+  gas. Builders see the limit in `peek` before they post.
 - **Small events.** `JITRoutedV1` and `JITDefaultV1` have the same fields, so routed and default
   outcomes compare directly.
 - **The floor is `amountOutMin` only.** The settler cannot know what the default would have paid.
