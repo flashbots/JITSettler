@@ -53,9 +53,8 @@ the caller compares the two itself.
 
 The executor is whatever code the setter chose, and it runs inside the caller's transaction. The
 sandbox keeps it from spending approvals given to the settler, nothing more. It can call back
-into the caller's contract, any contract that authorises by `tx.origin` sees the user, and it
-can use up the gas it is given. A caller that runs routes from setters it does not trust must be
-safe against all three.
+into the caller's contract, so guard the caller's entry points against re-entry, and it can use
+up the gas it is given, so cap that gas (requirement 6).
 
 ### Integrating as a caller
 
@@ -127,9 +126,7 @@ A builder can only route a caller's swaps if the caller keeps to these.
 9. **Check setters.** Keep a list of setters you trust and compare `peek`'s result against it.
    Without that check, flow A runs anyone's route: whoever sees the transaction, for example in a
    public mempool, can post a route just before it that pays exactly `amountOutMin` and keep the
-   difference. A caller that cannot keep a list can still run flow B's comparison for any live
-   route, so a route has to beat the measured default. It then pays for that trial whenever
-   anyone posts a route, and the warnings above about the executor's code apply in full.
+   difference. Both flows above check the setter.
 
 ### Builder behaviour
 
