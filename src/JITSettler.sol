@@ -14,9 +14,7 @@ interface IJITEvents {
         address indexed tokenOut,
         uint256 amountIn,
         uint256 amountOutMin,
-        uint256 amountOut,
-        address setter,
-        address executor
+        uint256 amountOut
     );
 
     /// @notice A caller ran its own default route instead of a JIT route. `amountOut` is what the
@@ -37,8 +35,8 @@ interface IJITEvents {
 
 /// @title JITSettler
 /// @notice Based on Gattaca's JIT settler PoC (gattaca-com/jit-settler-poc, commit 8615c54).
-///         Changes: `peek` takes the swap request, the settler emits `JITRoutedV1` on a fill,
-///         and `reportDefault` emits `JITDefaultV1` for callers.
+///         Changes: `peek` and `swap` take the swap request including a gas limit, the settler
+///         emits `JITRoutedV1` on a fill, and `reportDefault` emits `JITDefaultV1` for callers.
 contract JITSettler is IJITEvents {
     struct RouteHeader {
         address setter;
@@ -57,6 +55,7 @@ contract JITSettler is IJITEvents {
     error NoRoute();
     error TransferFailed();
     error InsufficientOutput(uint256 amountOut, uint256 amountOutMin);
+    error GasNotCapped(uint256 gasLimit);
 
     /// @notice Posts the route for this block. The setter is msg.sender. A builder can post
     ///         through its own contract, so it can rotate keys without callers changing the
@@ -76,20 +75,30 @@ contract JITSettler is IJITEvents {
         uint256, /* amountIn */
         address, /* tokenOut */
         uint256, /* amountOutMin */
-        address /* recipient */
-    ) external view returns (address setter) {
+        address, /* recipient */
+        uint256 /* gasLimit */
+    )
+        external
+        view
+        returns (address setter)
+    {
         RouteHeader storage header = _routeHeader;
         if (_isLive(header)) return header.setter;
     }
 
+    /// @param gasLimit The most gas this call may have. The caller calls `swap{gas: gasLimit}`,
+    ///        so a route cannot use up the gas the caller needs for its default route; a call
+    ///        that arrives with more gas reverts. Builders fit routes under it.
     /// @return amountOut What `recipient` received.
     function swap(
         address tokenIn,
         uint256 amountIn,
         address tokenOut,
         uint256 amountOutMin,
-        address recipient
+        address recipient,
+        uint256 gasLimit
     ) external returns (uint256 amountOut) {
+        if (gasleft() > gasLimit) revert GasNotCapped(gasLimit);
         RouteHeader storage stored = _routeHeader;
         if (!_isLive(stored)) revert NoRoute();
         // Consume and load before any external call, so a reentrant swap or setRoute can't touch
@@ -105,16 +114,7 @@ contract JITSettler is IJITEvents {
         amountOut = balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0;
         if (amountOut < amountOutMin) revert InsufficientOutput(amountOut, amountOutMin);
 
-        emit JITRoutedV1(
-            recipient,
-            tokenIn,
-            tokenOut,
-            amountIn,
-            amountOutMin,
-            amountOut,
-            header.setter,
-            header.executor
-        );
+        emit JITRoutedV1(recipient, tokenIn, tokenOut, amountIn, amountOutMin, amountOut);
     }
 
     /// @notice Emits `JITDefaultV1` for a caller that ran its own default route. Changes no state.
@@ -163,7 +163,9 @@ contract JITSettler is IJITEvents {
             token.call(abi.encodeCall(IERC20.transferFrom, (from, to, amount)));
         if (
             !success
-                || (returnData.length == 0 ? token.code.length == 0 : !abi.decode(returnData, (bool)))
+                || (returnData.length == 0
+                        ? token.code.length == 0
+                        : !abi.decode(returnData, (bool)))
         ) {
             revert TransferFailed();
         }
