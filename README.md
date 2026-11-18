@@ -174,6 +174,10 @@ the order may call `swap`.
 - **Executors.** Any contract can be an executor, named per route, so a new router needs no
   settler change. `msg.sender == SANDBOX` tells an executor that it runs inside `swap` and has
   received `tokenIn`. Extra data, such as a signature, can follow the call data.
+- **Venues.** While a route runs, `currentRoute()` returns its setter and the caller of `swap`
+  (both 0 at any other time). A venue that wants to quote differently for JIT flow checks the
+  setter against builders it trusts, and optionally the caller against known aggregators. The
+  router's address alone does not show this, because anyone can post a route through any router.
 
 ### Events
 
@@ -244,6 +248,7 @@ executor's call data.
 - A post stores the executor's call data as is: 260 bytes, or 9 storage slots, in this test. Each
   extra 32 bytes costs about 5.6k to post when the stored word changes.
 - The sandbox adds about 3.4k to a routed swap.
+- `currentRoute` bookkeeping adds about 1.3k to a routed swap (measured after the table above).
 
 ## Development
 

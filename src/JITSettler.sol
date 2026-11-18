@@ -47,6 +47,10 @@ contract JITSettler is IJITEvents {
 
     RouteHeader private _routeHeader;
 
+    // The route `swap` is running, set only while its executor runs.
+    address private transient _currentSetter;
+    address private transient _currentCaller;
+
     error NoRoute();
     error TransferFailed();
     error InsufficientOutput(uint256 amountOut, uint256 amountOutMin);
@@ -101,12 +105,25 @@ contract JITSettler is IJITEvents {
 
         _transferFrom(tokenIn, msg.sender, header.executor, amountIn);
         uint256 balanceBefore = IERC20(tokenOut).balanceOf(recipient);
+        // Restore, not clear, so a swap nested inside an executor leaves the outer route visible.
+        (address prevSetter, address prevCaller) = (_currentSetter, _currentCaller);
+        (_currentSetter, _currentCaller) = (header.setter, msg.sender);
         SANDBOX.run{ gas: gasLimit }(header.executor, data);
+        (_currentSetter, _currentCaller) = (prevSetter, prevCaller);
         uint256 balanceAfter = IERC20(tokenOut).balanceOf(recipient);
         amountOut = balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0;
         if (amountOut < amountOutMin) revert InsufficientOutput(amountOut, amountOutMin);
 
         emit JITRoutedV1(recipient, tokenIn, tokenOut, amountIn, amountOutMin, amountOut);
+    }
+
+    /// @notice The route this settler is running: its setter and the caller of `swap`. Both are 0
+    ///         unless called while a route's executor runs.
+    /// @dev Lets a venue tell flow routed by a builder it trusts from other flow, for example to
+    ///      quote a tighter spread. A venue checks `setter` against its own list, and optionally
+    ///      `caller` against known aggregators. Only `swap` writes these values.
+    function currentRoute() external view returns (address setter, address caller) {
+        return (_currentSetter, _currentCaller);
     }
 
     /// @notice Emits `JITDefaultV1` for a caller that ran its own default route. Changes no state.
