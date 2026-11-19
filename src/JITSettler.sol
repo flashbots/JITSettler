@@ -82,6 +82,10 @@ contract JITSettler is IJITEvents {
     address private transient _currentSetter;
     address private transient _currentCaller;
 
+    // Counts `setRoute` calls in this transaction, so `swapWithCallback` can tell whether its
+    // callback overwrote the route data it has not loaded yet.
+    uint256 private transient _routeWrites;
+
     error NoRoute();
     error TransferFailed();
     error InsufficientOutput(uint256 amountOut, uint256 amountOutMin);
@@ -93,6 +97,9 @@ contract JITSettler is IJITEvents {
         _routeHeader =
             RouteHeader(msg.sender, uint64(block.timestamp), uint32(data.length), executor);
         _storeRouteData(data);
+        unchecked {
+            _routeWrites++;
+        }
     }
 
     /// @notice The setter of the route live in this block, or 0 if there is none.
@@ -107,8 +114,10 @@ contract JITSettler is IJITEvents {
     ///         receives less than `req.amountOutMin`. Call it in try/catch and fall back on revert.
     /// @return amountOut What `recipient` received.
     function swap(Request calldata req) external returns (uint256 amountOut) {
-        (bool live, RouteHeader memory header, bytes memory data) = _consumeRoute();
+        (bool live, RouteHeader memory header) = _consumeRoute();
         if (!live) revert NoRoute();
+        // Loaded before any external call, so a reentrant setRoute can't change it.
+        bytes memory data = _loadRouteData(header.dataLength);
         return _execute(
             header,
             data,
@@ -123,8 +132,9 @@ contract JITSettler is IJITEvents {
 
     /// @notice Runs the live route if the caller accepts it. The settler calls
     ///         `routeAvailable(setter)` on msg.sender, which returns its floor or reverts to
-    ///         decline. A declined route stays used. Reverts only if the route runs and pays less
-    ///         than the floor.
+    ///         decline. A declined route stays used, and its data is never loaded, so declining a
+    ///         large route costs little. If the callback posts a route, the call counts as
+    ///         declined. Reverts only if the route runs and pays less than the floor.
     /// @param gasLimit The most gas the route's executor gets; 0 means no cap. The callback is not
     ///        counted against it.
     /// @return outcome Whether the route ran. Unless `EXECUTED`, run your default route.
@@ -136,10 +146,12 @@ contract JITSettler is IJITEvents {
         address recipient,
         uint256 gasLimit
     ) external returns (Outcome outcome, uint256 amountOut) {
-        (bool live, RouteHeader memory header, bytes memory data) = _consumeRoute();
+        (bool live, RouteHeader memory header) = _consumeRoute();
         if (!live) return (Outcome.NO_ROUTE, 0);
+        uint256 writes = _routeWrites;
         (bool accepted, uint256 amountOutMin) = _askCaller(header.setter);
-        if (!accepted) return (Outcome.ROUTE_DECLINED, 0);
+        if (!accepted || _routeWrites != writes) return (Outcome.ROUTE_DECLINED, 0);
+        bytes memory data = _loadRouteData(header.dataLength);
         amountOut = _execute(
             header, data, tokenIn, tokenOut, amountIn, amountOutMin, recipient, gasLimit
         );
@@ -171,17 +183,13 @@ contract JITSettler is IJITEvents {
         return (_currentSetter, _currentCaller);
     }
 
-    // Marks the live route used and loads it, before any external call, so a reentrant swap or
-    // setRoute can't touch it.
-    function _consumeRoute()
-        private
-        returns (bool live, RouteHeader memory header, bytes memory data)
-    {
+    // Marks the live route used and reads its header, before any external call, so a reentrant
+    // swap can't run it again.
+    function _consumeRoute() private returns (bool live, RouteHeader memory header) {
         RouteHeader storage stored = _routeHeader;
-        if (!_isLive(stored)) return (false, header, data);
+        if (!_isLive(stored)) return (false, header);
         stored.timestamp = 0;
         header = stored;
-        data = _loadRouteData(header.dataLength);
         live = true;
     }
 

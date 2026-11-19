@@ -224,16 +224,34 @@ contract CallbackTest is Test, IJITEvents {
 
     /// A route posted from inside the callback does not replace the one being run, and
     /// `currentRoute` is 0 during the callback.
-    function test_routePostedInCallback_doesNotReplaceRunningRoute() public {
+    /// A callback that posts a route could overwrite the data of the route being run, which is
+    /// loaded only after the callback, so the call counts as declined and nothing runs.
+    function test_routePostedInCallback_declines() public {
         ReentrantCaller rc = new ReentrantCaller(settler, tIn, tOut, recipient, address(exec));
         tIn.mint(address(rc), 1e18);
         _post(builder, 110e18, 105e18);
         (JITSettler.Outcome o, uint256 out) = rc.run();
-        assertEq(uint8(o), uint8(JITSettler.Outcome.EXECUTED));
-        assertEq(out, 105e18);
+        assertEq(uint8(o), uint8(JITSettler.Outcome.ROUTE_DECLINED));
+        assertEq(out, 0);
         assertEq(rc.seenSetter(), address(0));
-        // The route posted inside the callback is still live, with rc as its setter.
+        assertEq(tOut.balanceOf(recipient), 0);
+        assertEq(tIn.balanceOf(address(rc)), 1e18);
+        // The route posted inside the callback is live, with rc as its setter.
         assertEq(_peek(), address(rc));
+    }
+
+    /// Declining a large route from an untrusted setter does not load its data.
+    function test_largeUntrustedRoute_declinedCheaply() public {
+        caller.configure(100e18, 101e18, false, false);
+        vm.prank(makeAddr("other"));
+        settler.setRoute(address(exec), new bytes(32 * 1024));
+        uint256 before = gasleft();
+        vm.prank(address(caller));
+        (JITSettler.Outcome o,) =
+            settler.swapWithCallback(address(tIn), address(tOut), 1e18, recipient, 0);
+        uint256 used = before - gasleft();
+        assertEq(uint8(o), uint8(JITSettler.Outcome.ROUTE_DECLINED));
+        assertLt(used, 60_000); // about 39k; loading 1,024 words would cost about 2.1M
     }
 }
 
