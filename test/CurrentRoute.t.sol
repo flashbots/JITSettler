@@ -2,7 +2,7 @@
 pragma solidity ^0.8.28;
 
 import { Test } from "forge-std/Test.sol";
-import { JITSettler } from "../src/JITSettler.sol";
+import { JITSettler, Request } from "../src/JITSettler.sol";
 import { MockToken, G } from "./JITSettler.t.sol";
 
 /// A venue that records what `currentRoute` says when it is called, then pays `out` to `to`.
@@ -37,7 +37,7 @@ contract NestingExecutor {
         settler.setRoute(innerExecutor, innerData);
         tIn.mint(address(this), 1);
         tIn.approve(address(settler), 1);
-        settler.swap{ gas: G }(address(tIn), 1, address(tOut), 0, address(this), G);
+        settler.swap{ gas: G }(Request(address(tIn), address(tOut), 1, 0, address(this), G));
         venue.fill(tOut, recipient, out);
     }
 }
@@ -73,7 +73,7 @@ contract CurrentRouteTest is Test {
             address(venue), abi.encodeCall(RecordingVenue.fill, (tOut, recipient, 5e18))
         );
         vm.prank(aggregator);
-        settler.swap{ gas: G }(address(tIn), 1e18, address(tOut), 1, recipient, G);
+        settler.swap{ gas: G }(Request(address(tIn), address(tOut), 1e18, 1, recipient, G));
 
         assertEq(venue.seenSetter(), builder);
         assertEq(venue.seenCaller(), aggregator);
@@ -95,7 +95,7 @@ contract CurrentRouteTest is Test {
             )
         );
         vm.prank(aggregator);
-        settler.swap{ gas: G }(address(tIn), 1e18, address(tOut), 1, recipient, G);
+        settler.swap{ gas: G }(Request(address(tIn), address(tOut), 1e18, 1, recipient, G));
 
         // The inner route was posted by the executor and swapped by it.
         assertEq(innerVenue.seenSetter(), address(nester));

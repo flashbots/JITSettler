@@ -3,36 +3,67 @@ pragma solidity ^0.8.28;
 
 import { IERC20 } from "./IERC20.sol";
 
-/// @notice Events of the JIT settler standard. The settler emits `JITRoutedV1` on a fill and
-///         `JITDefaultV1` when a caller reports its own default route through `reportDefault`.
+/// @notice A swap request. Same field order and types as JITSettler v1.3.0, so `swap(Request)`
+///         keeps its selector.
+struct Request {
+    address tokenIn;
+    address tokenOut;
+    uint256 amountIn;
+    uint256 amountOutMin;
+    address recipient;
+    /// @dev The most gas the route's executor gets; 0 means no cap.
+    uint256 gasLimit;
+}
+
+/// @notice Events of the JIT settler standard. Both swap paths emit `JITRoutedV1` on a fill.
+///         `reportDefault` emits `JITDefaultV1` for a caller that ran its own default route.
 interface IJITEvents {
-    /// @notice Emitted by the settler when a swap fills through a posted route.
+    /// @notice A swap filled through a posted route. `caller` called the settler, `setter`
+    ///         posted the route, `executor` ran it.
     event JITRoutedV1(
-        address indexed recipient,
-        address indexed tokenIn,
-        address indexed tokenOut,
+        address indexed caller,
+        address indexed setter,
+        address indexed executor,
+        address tokenIn,
+        address tokenOut,
+        address recipient,
         uint256 amountIn,
         uint256 amountOutMin,
         uint256 amountOut
     );
 
-    /// @notice A caller ran its own default route instead of a JIT route. `amountOut` is what the
-    ///         recipient received from that route, as the caller reports it.
+    /// @notice `reporter` ran its own default route. `amountOut` is what the recipient received
+    ///         from it, as the reporter says. Builders count a report only when `reporter` is the
+    ///         contract that called `peek` or a swap function.
     event JITDefaultV1(
-        address indexed recipient,
+        address indexed reporter,
         address indexed tokenIn,
         address indexed tokenOut,
+        address recipient,
         uint256 amountIn,
         uint256 amountOutMin,
         uint256 amountOut
     );
 }
 
+/// @notice Implemented by callers of `swapWithCallback`.
+interface ISettlerCaller {
+    /// @notice Called by `swapWithCallback` when a route is live. Return the least `recipient`
+    ///         must receive to run it, or revert to decline it.
+    function routeAvailable(address setter) external returns (uint256 amountOutMin);
+}
+
 /// @title JITSettler
-/// @notice Based on Gattaca's JIT settler PoC (gattaca-com/jit-settler-poc, commit 8615c54).
-///         Changes: `peek` and `swap` take the swap request including a gas limit, the settler
-///         emits `JITRoutedV1` on a fill, and `reportDefault` emits `JITDefaultV1` for callers.
+/// @notice Based on Gattaca's JIT settler PoC (gattaca-com/jit-settler-poc). Two ways to call it:
+///         `peek` + `swap` (the caller passes its floor and reverts on no route), or
+///         `swapWithCallback` (the settler asks the caller for its floor and returns the outcome).
 contract JITSettler is IJITEvents {
+    enum Outcome {
+        NO_ROUTE,
+        ROUTE_DECLINED,
+        EXECUTED
+    }
+
     struct RouteHeader {
         address setter;
         uint64 timestamp;
@@ -47,7 +78,7 @@ contract JITSettler is IJITEvents {
 
     RouteHeader private _routeHeader;
 
-    // The route `swap` is running, set only while its executor runs.
+    // The route the settler is running, set only while its executor runs.
     address private transient _currentSetter;
     address private transient _currentCaller;
 
@@ -65,77 +96,142 @@ contract JITSettler is IJITEvents {
     }
 
     /// @notice The setter of the route live in this block, or 0 if there is none.
-    /// @dev Takes the same request as `swap` so a builder can read the request from the call in
-    ///      a simulation where no route is posted yet (and `peek` therefore returns 0). The
-    ///      arguments are not used on chain.
-    function peek(
-        address, /* tokenIn */
-        uint256, /* amountIn */
-        address, /* tokenOut */
-        uint256, /* amountOutMin */
-        address, /* recipient */
-        uint256 /* gasLimit */
-    )
-        external
-        view
-        returns (address setter)
-    {
+    /// @dev Takes the request so a builder can read it from the call in a simulation where no
+    ///      route is posted yet. The request is not used on chain.
+    function peek(Request calldata) external view returns (address setter) {
         RouteHeader storage header = _routeHeader;
         if (_isLive(header)) return header.setter;
     }
 
-    /// @param gasLimit The most gas the route's executor gets, so a route cannot use up the gas
-    ///        the caller needs for its default route. Builders fit routes under it.
+    /// @notice Runs the live route for `req`. Reverts if there is none, or if `recipient`
+    ///         receives less than `req.amountOutMin`. Call it in try/catch and fall back on revert.
     /// @return amountOut What `recipient` received.
-    function swap(
+    function swap(Request calldata req) external returns (uint256 amountOut) {
+        (bool live, RouteHeader memory header, bytes memory data) = _consumeRoute();
+        if (!live) revert NoRoute();
+        return _execute(
+            header,
+            data,
+            req.tokenIn,
+            req.tokenOut,
+            req.amountIn,
+            req.amountOutMin,
+            req.recipient,
+            req.gasLimit
+        );
+    }
+
+    /// @notice Runs the live route if the caller accepts it. The settler calls
+    ///         `routeAvailable(setter)` on msg.sender, which returns its floor or reverts to
+    ///         decline. A declined route stays used. Reverts only if the route runs and pays less
+    ///         than the floor.
+    /// @param gasLimit The most gas the route's executor gets; 0 means no cap. The callback is not
+    ///        counted against it.
+    /// @return outcome Whether the route ran. Unless `EXECUTED`, run your default route.
+    /// @return amountOut What `recipient` received if `EXECUTED`, else 0.
+    function swapWithCallback(
         address tokenIn,
-        uint256 amountIn,
         address tokenOut,
+        uint256 amountIn,
+        address recipient,
+        uint256 gasLimit
+    ) external returns (Outcome outcome, uint256 amountOut) {
+        (bool live, RouteHeader memory header, bytes memory data) = _consumeRoute();
+        if (!live) return (Outcome.NO_ROUTE, 0);
+        (bool accepted, uint256 amountOutMin) = _askCaller(header.setter);
+        if (!accepted) return (Outcome.ROUTE_DECLINED, 0);
+        amountOut = _execute(
+            header, data, tokenIn, tokenOut, amountIn, amountOutMin, recipient, gasLimit
+        );
+        return (Outcome.EXECUTED, amountOut);
+    }
+
+    /// @notice Emits `JITDefaultV1` for a caller that ran its own default route. Optional for
+    ///         callers. Changes no state.
+    /// @param amountOut What `req.recipient` received from the default route.
+    function reportDefault(Request calldata req, uint256 amountOut) external {
+        emit JITDefaultV1(
+            msg.sender,
+            req.tokenIn,
+            req.tokenOut,
+            req.recipient,
+            req.amountIn,
+            req.amountOutMin,
+            amountOut
+        );
+    }
+
+    /// @notice The route this settler is running: its setter and the caller of the swap. Both
+    ///         are 0 unless called while a route's executor runs.
+    /// @dev Lets a venue tell flow routed by a builder it trusts from other flow, for example to
+    ///      quote a tighter spread, and lets an executor check who posted its route. A venue checks
+    ///      `setter` against its own list, and optionally `caller` against known aggregators.
+    ///      Only the swap functions write these values.
+    function currentRoute() external view returns (address setter, address caller) {
+        return (_currentSetter, _currentCaller);
+    }
+
+    // Marks the live route used and loads it, before any external call, so a reentrant swap or
+    // setRoute can't touch it.
+    function _consumeRoute()
+        private
+        returns (bool live, RouteHeader memory header, bytes memory data)
+    {
+        RouteHeader storage stored = _routeHeader;
+        if (!_isLive(stored)) return (false, header, data);
+        stored.timestamp = 0;
+        header = stored;
+        data = _loadRouteData(header.dataLength);
+        live = true;
+    }
+
+    // Calls routeAvailable(setter) on msg.sender. Any failure, including a caller without code or
+    // a short return, counts as a decline. Return data past the first word is not copied.
+    function _askCaller(address setter) private returns (bool accepted, uint256 amountOutMin) {
+        bytes4 selector = ISettlerCaller.routeAvailable.selector;
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            mstore(ptr, selector)
+            mstore(add(ptr, 0x04), setter)
+            let ok := call(gas(), caller(), 0, ptr, 0x24, ptr, 0x20)
+            accepted := and(ok, gt(returndatasize(), 0x1f))
+            if accepted { amountOutMin := mload(ptr) }
+        }
+    }
+
+    function _execute(
+        RouteHeader memory header,
+        bytes memory data,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
         uint256 amountOutMin,
         address recipient,
         uint256 gasLimit
-    ) external returns (uint256 amountOut) {
-        RouteHeader storage stored = _routeHeader;
-        if (!_isLive(stored)) revert NoRoute();
-        // Consume and load before any external call, so a reentrant swap or setRoute can't touch
-        // this route.
-        stored.timestamp = 0;
-        RouteHeader memory header = stored;
-        bytes memory data = _loadRouteData(header.dataLength);
-
+    ) private returns (uint256 amountOut) {
         _transferFrom(tokenIn, msg.sender, header.executor, amountIn);
         uint256 balanceBefore = IERC20(tokenOut).balanceOf(recipient);
         // Restore, not clear, so a swap nested inside an executor leaves the outer route visible.
         (address prevSetter, address prevCaller) = (_currentSetter, _currentCaller);
         (_currentSetter, _currentCaller) = (header.setter, msg.sender);
-        SANDBOX.run{ gas: gasLimit }(header.executor, data);
+        // A request for more gas than is left gets what is left, so 0 can mean no cap.
+        SANDBOX.run{ gas: gasLimit == 0 ? gasleft() : gasLimit }(header.executor, data);
         (_currentSetter, _currentCaller) = (prevSetter, prevCaller);
         uint256 balanceAfter = IERC20(tokenOut).balanceOf(recipient);
         amountOut = balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0;
         if (amountOut < amountOutMin) revert InsufficientOutput(amountOut, amountOutMin);
 
-        emit JITRoutedV1(recipient, tokenIn, tokenOut, amountIn, amountOutMin, amountOut);
-    }
-
-    /// @notice The route this settler is running: its setter and the caller of `swap`. Both are 0
-    ///         unless called while a route's executor runs.
-    /// @dev Lets a venue tell flow routed by a builder it trusts from other flow, for example to
-    ///      quote a tighter spread. A venue checks `setter` against its own list, and optionally
-    ///      `caller` against known aggregators. Only `swap` writes these values.
-    function currentRoute() external view returns (address setter, address caller) {
-        return (_currentSetter, _currentCaller);
-    }
-
-    /// @notice Emits `JITDefaultV1` for a caller that ran its own default route. Changes no state.
-    function reportDefault(
-        address tokenIn,
-        uint256 amountIn,
-        address tokenOut,
-        uint256 amountOutMin,
-        address recipient,
-        uint256 amountOut
-    ) external {
-        emit JITDefaultV1(recipient, tokenIn, tokenOut, amountIn, amountOutMin, amountOut);
+        emit JITRoutedV1(
+            msg.sender,
+            header.setter,
+            header.executor,
+            tokenIn,
+            tokenOut,
+            recipient,
+            amountIn,
+            amountOutMin,
+            amountOut
+        );
     }
 
     function _isLive(RouteHeader storage header) private view returns (bool) {
@@ -182,18 +278,26 @@ contract JITSettler is IJITEvents {
 // Calls the executor. It holds no approvals, so setting executor = erc20 can't spend what other
 // callers approved.
 contract Sandbox {
+    // Revert data longer than this is cut, so copying it back costs the caller little gas.
+    uint256 private constant _MAX_REVERT_DATA = 0x104;
+
     address private immutable SETTLER = msg.sender;
 
     function run(address executor, bytes calldata data) external {
-        // Lets executors rely on msg.sender == SANDBOX meaning "inside swap, tokenIn already
-        // delivered".
+        // msg.sender == SANDBOX only tells an executor that some swap is running: anyone can post a
+        // route naming any executor. Executors check JITSettler.currentRoute().setter and measure
+        // the tokenIn they received.
         if (msg.sender != SETTLER) revert();
         assembly ("memory-safe") {
+            // A route to an address without code would "succeed" without paying anything.
+            if iszero(extcodesize(executor)) { revert(0, 0) }
             let input := mload(0x40)
             calldatacopy(input, data.offset, data.length)
             if iszero(call(gas(), executor, 0, input, data.length, 0, 0)) {
-                returndatacopy(input, 0, returndatasize())
-                revert(input, returndatasize())
+                let size := returndatasize()
+                if gt(size, _MAX_REVERT_DATA) { size := _MAX_REVERT_DATA }
+                returndatacopy(input, 0, size)
+                revert(input, size)
             }
         }
     }
