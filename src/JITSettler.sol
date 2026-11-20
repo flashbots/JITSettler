@@ -87,7 +87,8 @@ contract JITSettler is IJITEvents {
     // callback overwrote the route data it has not loaded yet.
     uint256 private transient _routeWrites;
 
-    // Loading a word of route data costs at least a cold SLOAD.
+    // Loading a word of route data costs at least a cold SLOAD. Routes are posted in an earlier
+    // transaction, so their slots are cold; a caller that warms them only gets a stricter check.
     uint256 private constant _MIN_LOAD_GAS_PER_WORD = 2100;
 
     error NoRoute();

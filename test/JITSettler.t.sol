@@ -218,9 +218,12 @@ contract JITSettlerTest is Test, IJITEvents {
         vm.prank(builder);
         settler.setRoute(address(exec), _data(110e18, 105e18, new bytes(4096)));
         vm.prank(user);
+        // Empty revert data: the executor ran out of gas, not RouteTooLarge.
         try settler.swap(_req(100e18, limit)) {
             fail();
-        } catch { }
+        } catch (bytes memory err) {
+            assertEq(err.length, 0);
+        }
         vm.prank(user);
         assertEq(settler.swap(_req(100e18, 0)), 105e18);
     }
