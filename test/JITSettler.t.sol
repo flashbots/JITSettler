@@ -192,6 +192,39 @@ contract JITSettlerTest is Test, IJITEvents {
         assertEq(settler.swap(_req(100e18, 0)), 105e18);
     }
 
+    /// A route whose data alone would use up gasLimit reverts before any data is loaded, and
+    /// stays live.
+    function test_swap_routeTooLarge_revertsCheaply() public {
+        vm.prank(builder);
+        settler.setRoute(address(exec), new bytes(32 * 1024));
+        uint256 before = gasleft();
+        vm.prank(user);
+        vm.expectRevert(JITSettler.RouteTooLarge.selector);
+        settler.swap(_req(1, 500_000));
+        assertLt(before - gasleft(), 60_000);
+        assertEq(settler.peek(_req(1, G)), builder);
+    }
+
+    /// Loading the route data counts against gasLimit: the same fill with 4 KB of trailing data
+    /// fails at a gasLimit that the fill alone fits in, and fills with no cap.
+    function test_swap_loadCountsAgainstGasLimit() public {
+        uint256 limit = 330_000;
+        _post(110e18, 105e18);
+        vm.prank(user);
+        assertEq(settler.swap(_req(100e18, 150_000)), 105e18); // the fill alone fits in 150k
+
+        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + 12);
+        vm.prank(builder);
+        settler.setRoute(address(exec), _data(110e18, 105e18, new bytes(4096)));
+        vm.prank(user);
+        try settler.swap(_req(100e18, limit)) {
+            fail();
+        } catch { }
+        vm.prank(user);
+        assertEq(settler.swap(_req(100e18, 0)), 105e18);
+    }
+
     /// A call with more gas than `gasLimit` is fine.
     function test_swap_moreGasThanLimit_fills() public {
         _post(110e18, 105e18);

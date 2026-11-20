@@ -240,6 +240,17 @@ contract CallbackTest is Test, IJITEvents {
         assertEq(_peek(), address(rc));
     }
 
+    /// A trusted route whose data would use up gasLimit is declined before the callback.
+    function test_routeTooLarge_declinedBeforeCallback() public {
+        caller.configure(100e18, 101e18, false, false);
+        vm.prank(builder);
+        settler.setRoute(address(exec), new bytes(32 * 1024));
+        (JITSettler.Outcome o, uint256 out) = caller.run(500_000);
+        assertEq(uint8(o), uint8(JITSettler.Outcome.ROUTE_DECLINED));
+        assertEq(out, 101e18);
+        assertEq(caller.callbacks(), 0);
+    }
+
     /// Declining a large route from an untrusted setter does not load its data.
     function test_largeUntrustedRoute_declinedCheaply() public {
         caller.configure(100e18, 101e18, false, false);
