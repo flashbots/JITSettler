@@ -110,8 +110,9 @@ contract JITSettler is IJITEvents {
         if (_isLive(header)) return header.setter;
     }
 
-    /// @notice Runs the live route for `req`. Reverts if there is none, or if `recipient`
-    ///         receives less than `req.amountOutMin`. Call it in try/catch and fall back on revert.
+    /// @notice Runs the live route for `req`. Reverts if there is none, if the route fails, or if
+    ///         `recipient` receives less than `req.amountOutMin`. Call it in try/catch with a gas
+    ///         cap, and fall back on any revert; revert data may come from the executor.
     /// @return amountOut What `recipient` received.
     function swap(Request calldata req) external returns (uint256 amountOut) {
         (bool live, RouteHeader memory header) = _consumeRoute();
@@ -134,7 +135,9 @@ contract JITSettler is IJITEvents {
     ///         `routeAvailable(setter)` on msg.sender, which returns its floor or reverts to
     ///         decline. A declined route stays used, and its data is never loaded, so declining a
     ///         large route costs little. If the callback posts a route, the call counts as
-    ///         declined. Reverts only if the route runs and pays less than the floor.
+    ///         declined. After the caller accepts, it reverts if the route fails: the transfer of
+    ///         tokenIn fails, the executor reverts or has no code, or `recipient` gets less than
+    ///         the floor. Treat any revert as a failed route; its data may come from the executor.
     /// @param gasLimit The most gas the route's executor gets; 0 means no cap. The callback is not
     ///        counted against it.
     /// @return outcome Whether the route ran. Unless `EXECUTED`, run your default route.
