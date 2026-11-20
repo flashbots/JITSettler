@@ -29,16 +29,15 @@ from Gattaca's proof of concept,
 | `currentRoute()` | executor, venue | While a route runs, returns its setter and the caller of the swap; otherwise 0. |
 
 Below, `req` is the request `(tokenIn, tokenOut, amountIn, amountOutMin, recipient, gasLimit)`.
-`gasLimit` is the most gas the route can use: loading its data plus running its executor. 0 means
-no cap. The route gets less if the swap itself runs short of gas.
+`gasLimit` is the most gas the caller gives the route. Builders read it to find routes that fit.
+The settler does not enforce it: the caller caps its own call (requirement 6).
 
 `swap`:
 
 1. Checks that a route was posted in this block, and marks it used before any external call.
-2. Loads the route's data. If the data alone would use up `gasLimit`, reverts with
-   `RouteTooLarge` before loading it.
+2. Loads the route's data.
 3. Transfers `amountIn` of `tokenIn` from `msg.sender` to the route's executor.
-4. Calls the executor with the posted data, through the sandbox, with the rest of `gasLimit`.
+4. Calls the executor with the posted data, through the sandbox.
 5. Checks that `recipient`'s `tokenOut` balance grew by at least `amountOutMin`.
 6. Emits `JITRoutedV1`.
 
@@ -61,8 +60,8 @@ caller checks.
 
 The executor is code the setter chose, running inside the caller's transaction. It can call back
 into the caller's contract, so every external function of the caller that changes state or moves
-tokens needs a re-entry guard. It can also use all the gas it gets, which `gasLimit` bounds. Both
-flows below show the guard.
+tokens needs a re-entry guard. It can also use all the gas it gets, so the caller caps its call to
+the settler. The flows below show the guard.
 
 ### Integrating as a caller
 
@@ -77,7 +76,7 @@ still use flow A through generic call actions, if it can catch a revert and fall
 function execute(req, trustedSetters, defaultRoute) nonReentrant:
     s = settler.peek(req)                    // setter, or 0
     if s != 0 and s in trustedSetters:
-        try settler.swap(req) -> out:
+        try settler.swap{gas: cap}(req) -> out:  // the caller caps the route's gas
             return out
         catch:
             // fall through to the default
@@ -100,7 +99,7 @@ function execute(req, trustedSetters, defaultRoute) nonReentrant:
         try this.trialDefault(defaultRoute):     // always reverts
         catch (bytes err):
             if err is Measured(dOut):            // the default's output on the current state
-                try this.jitSwap(req, dOut) -> out:
+                try this.jitSwap{gas: cap}(req, dOut) -> out:
                     return out
                 catch:
                     // fall through to the default
@@ -141,10 +140,12 @@ floor or reverts to decline. The floor can come from a trial of the default, as 
 
 ```
 function execute(req, trustedSetters, defaultRoute) nonReentrant:
-    (outcome, out) = settler.swapWithCallback(req.tokenIn, req.tokenOut, req.amountIn,
-                                              req.recipient, req.gasLimit)
-    if outcome == EXECUTED:
-        return out
+    try settler.swapWithCallback{gas: cap}(req.tokenIn, req.tokenOut, req.amountIn,
+                                           req.recipient, req.gasLimit) -> (outcome, out):
+        if outcome == EXECUTED:
+            return out
+    catch:
+        // the route failed after we accepted it; fall through to the default
     out = runDefault(defaultRoute)
     require(out >= userMinOut)
     return out
@@ -156,9 +157,8 @@ function routeAvailable(setter) -> floor:
     return userMinOut                          // or dOut + 1 from a trial of the default
 ```
 
-`swapWithCallback` declines a route, without calling back, if its data alone would use up
-`gasLimit`. A declined route stays used for the rest of the block, and its data is not loaded, so
-declining costs little. If the callback posts a route itself, the call counts as declined. After
+A declined route stays used for the rest of the block, and its data is not loaded, so declining
+costs little. The gas cap on `swapWithCallback` has to cover the callback as well as the route. If the callback posts a route itself, the call counts as declined. After
 the caller accepts, a route that fails or pays less than the floor reverts the whole call, as
 `swap` does, so wrap it in `try`/`catch` too. A revert's data may come from the executor, so treat
 any revert as a failed route.
@@ -183,12 +183,12 @@ A builder can only route a caller's swaps if the caller follows these rules.
    `swap` measures it, so the two outputs compare.
 6. **Never fail the order on a JIT revert.** Call `swap` in `try`/`catch` and fall back on any
    revert. A route that was replaced, went stale or ran out of gas then costs a fall-back, not the
-   user's transaction. `gasLimit` is an upper bound: if `swap` gets too little gas, the route gets
-   less than `gasLimit` and may fail. Before calling `swap`, make sure the transaction has gas for
-   `gasLimit`, the settler's transfer and checks, the default route and the report. If it does
-   not, skip the JIT attempt. `gasLimit` covers loading the route's data and running the executor.
-   The transfer of `tokenIn` is outside it, so a token with transfer hooks (for example ERC-777)
-   runs them uncapped. Cap your own call to the settler as well, which bounds everything.
+   user's transaction. The settler does not enforce `gasLimit`, so cap your own call, for example
+   `settler.swap{gas: cap}(req)`. The cap bounds everything the route can cost you: loading its
+   data (about 2.1k gas per 32 bytes, size chosen by the setter), the transfer of `tokenIn`
+   (including any token hooks) and the executor. Set `gasLimit` to the gas you leave for the route,
+   so builders only post routes that fit. Before the call, make sure the transaction has gas for
+   the cap, the default route and the report. If it does not, skip the JIT attempt.
 7. **Funded and approved.** When it calls `swap`, `msg.sender` holds `amountIn` of `tokenIn` and
    has approved the settler for it.
 8. **ERC-20 tokens only.** The settler uses `transferFrom` and `balanceOf`. Wrap or unwrap native
@@ -271,10 +271,10 @@ In `JITRoutedV1` from `swapWithCallback`, `amountOutMin` is the floor the callba
   an arbitrary executor, a route could spend those approvals, for example by naming a token as the
   executor. A fixed selector would also stop that, barring a selector collision, but would limit
   executors to one function. The sandbox costs about 3.4k gas per routed swap.
-- **`gasLimit` in the request.** The route's data and code could use up the gas the caller needs
-  for its default. The settler charges loading the data to `gasLimit`, refuses a route whose data
-  alone would use it up before loading any, and gives the executor the rest. Requirement 6 covers
-  the rest of a JIT attempt's gas. Builders see the limit in `peek` before they post.
+- **`gasLimit` in the request, enforced by the caller.** The route's data and code could use up
+  the gas the caller needs for its default. A cap on the caller's own call bounds all of it, so the
+  settler passes `gasLimit` through for builders to read and does not enforce it. Builders see the
+  limit in `peek` before they post.
 - **Matching events.** `JITRoutedV1` and `JITDefaultV1` share the request fields, so routed and
   default outcomes compare directly. `JITRoutedV1` also names the caller, setter and executor.
 - **The floor is the caller's.** The settler cannot know what the default would have paid. A
