@@ -84,7 +84,7 @@ contract CallbackCaller is ISettlerCaller {
         external
         returns (JITSettler.Outcome outcome, uint256 out, bool reverted)
     {
-        try settler.swapWithCallback(
+        try settler.swapWithCallback{ gas: gasLimit }(
             address(tIn), address(tOut), 1e18, recipient, gasLimit
         ) returns (
             JITSettler.Outcome o, uint256 a
@@ -208,17 +208,17 @@ contract CallbackTest is Test, IJITEvents {
         assertEq(uint8(o), uint8(JITSettler.Outcome.ROUTE_DECLINED));
     }
 
-    /// The gas limit applies to the executor after the callback; a burner route reverts the call
-    /// without eating the caller's gas.
-    function test_gasLimit_capsExecutor_afterCallback() public {
+    /// The settler does not enforce gasLimit; a caller that caps its own call keeps the rest of
+    /// its gas when a burner route reverts the call after the callback.
+    function test_callerCapsItsOwnCall() public {
         caller.configure(1, 101e18, false, false);
         GasBurner burner = new GasBurner();
         vm.prank(builder);
         settler.setRoute(address(burner), abi.encodeCall(GasBurner.burn, ()));
         uint256 before = gasleft();
-        (,, bool reverted) = caller.runCatching(100_000);
+        (,, bool reverted) = caller.runCatching(250_000);
         assertTrue(reverted);
-        assertLt(before - gasleft(), 300_000);
+        assertLt(before - gasleft(), 400_000);
         assertEq(caller.callbacks(), 0); // the counted callback was reverted with the rest
     }
 
@@ -238,17 +238,6 @@ contract CallbackTest is Test, IJITEvents {
         assertEq(tIn.balanceOf(address(rc)), 1e18);
         // The route posted inside the callback is live, with rc as its setter.
         assertEq(_peek(), address(rc));
-    }
-
-    /// A trusted route whose data would use up gasLimit is declined before the callback.
-    function test_routeTooLarge_declinedBeforeCallback() public {
-        caller.configure(100e18, 101e18, false, false);
-        vm.prank(builder);
-        settler.setRoute(address(exec), new bytes(32 * 1024));
-        (JITSettler.Outcome o, uint256 out) = caller.run(500_000);
-        assertEq(uint8(o), uint8(JITSettler.Outcome.ROUTE_DECLINED));
-        assertEq(out, 101e18);
-        assertEq(caller.callbacks(), 0);
     }
 
     /// Declining a large route from an untrusted setter does not load its data.

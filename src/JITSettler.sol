@@ -11,8 +11,8 @@ struct Request {
     uint256 amountIn;
     uint256 amountOutMin;
     address recipient;
-    /// @dev The most gas the route can use: loading its data plus running its executor. 0 means
-    ///      no cap.
+    /// @dev The most gas the caller gives the route, for builders to read. The settler does not
+    ///      enforce it; the caller caps its own call.
     uint256 gasLimit;
 }
 
@@ -87,12 +87,7 @@ contract JITSettler is IJITEvents {
     // callback overwrote the route data it has not loaded yet.
     uint256 private transient _routeWrites;
 
-    // Loading a word of route data costs at least a cold SLOAD. Routes are posted in an earlier
-    // transaction, so their slots are cold; a caller that warms them only gets a stricter check.
-    uint256 private constant _MIN_LOAD_GAS_PER_WORD = 2100;
-
     error NoRoute();
-    error RouteTooLarge();
     error TransferFailed();
     error InsufficientOutput(uint256 amountOut, uint256 amountOutMin);
 
@@ -117,26 +112,17 @@ contract JITSettler is IJITEvents {
     }
 
     /// @notice Runs the live route for `req`. Reverts if there is none, if the route fails, or if
-    ///         `recipient` receives less than `req.amountOutMin`. Reverts with `RouteTooLarge` if
-    ///         loading the route's data would use up `req.gasLimit`. Call it in try/catch with a
-    ///         gas cap, and fall back on any revert; revert data may come from the executor.
+    ///         `recipient` receives less than `req.amountOutMin`. Call it in try/catch with a gas
+    ///         cap, and fall back on any revert; revert data may come from the executor. The
+    ///         settler does not enforce `req.gasLimit`: the route gets all the gas the call has.
     /// @return amountOut What `recipient` received.
     function swap(Request calldata req) external returns (uint256 amountOut) {
         (bool live, RouteHeader memory header) = _consumeRoute();
         if (!live) revert NoRoute();
         // Loaded before any external call, so a reentrant setRoute can't change it.
-        (bool fits, bytes memory data, uint256 executorGas) =
-            _loadRoute(header.dataLength, req.gasLimit);
-        if (!fits) revert RouteTooLarge();
+        bytes memory data = _loadRouteData(header.dataLength);
         return _execute(
-            header,
-            data,
-            req.tokenIn,
-            req.tokenOut,
-            req.amountIn,
-            req.amountOutMin,
-            req.recipient,
-            executorGas
+            header, data, req.tokenIn, req.tokenOut, req.amountIn, req.amountOutMin, req.recipient
         );
     }
 
@@ -144,12 +130,11 @@ contract JITSettler is IJITEvents {
     ///         `routeAvailable(setter)` on msg.sender, which returns its floor or reverts to
     ///         decline. A declined route stays used, and its data is never loaded, so declining a
     ///         large route costs little. If the callback posts a route, the call counts as
-    ///         declined. A route whose data would use up `gasLimit` is declined before the
-    ///         callback. After the caller accepts, it reverts if the route fails: the transfer of
+    ///         declined. After the caller accepts, it reverts if the route fails: the transfer of
     ///         tokenIn fails, the executor reverts or has no code, or `recipient` gets less than
     ///         the floor. Treat any revert as a failed route; its data may come from the executor.
-    /// @param gasLimit The most gas the route can use: loading its data plus running its executor.
-    ///        0 means no cap. The callback is not counted against it.
+    ///         The last argument is the request's gas limit, for builders to read. The settler
+    ///         does not enforce it: cap your own call.
     /// @return outcome Whether the route ran. Unless `EXECUTED`, run your default route.
     /// @return amountOut What `recipient` received if `EXECUTED`, else 0.
     function swapWithCallback(
@@ -157,20 +142,15 @@ contract JITSettler is IJITEvents {
         address tokenOut,
         uint256 amountIn,
         address recipient,
-        uint256 gasLimit
+        uint256 /* gasLimit */
     ) external returns (Outcome outcome, uint256 amountOut) {
         (bool live, RouteHeader memory header) = _consumeRoute();
         if (!live) return (Outcome.NO_ROUTE, 0);
-        if (!_mayFit(header.dataLength, gasLimit)) return (Outcome.ROUTE_DECLINED, 0);
         uint256 writes = _routeWrites;
         (bool accepted, uint256 amountOutMin) = _askCaller(header.setter);
         if (!accepted || _routeWrites != writes) return (Outcome.ROUTE_DECLINED, 0);
-        (bool fits, bytes memory data, uint256 executorGas) =
-            _loadRoute(header.dataLength, gasLimit);
-        if (!fits) return (Outcome.ROUTE_DECLINED, 0);
-        amountOut = _execute(
-            header, data, tokenIn, tokenOut, amountIn, amountOutMin, recipient, executorGas
-        );
+        bytes memory data = _loadRouteData(header.dataLength);
+        amountOut = _execute(header, data, tokenIn, tokenOut, amountIn, amountOutMin, recipient);
         return (Outcome.EXECUTED, amountOut);
     }
 
@@ -223,28 +203,6 @@ contract JITSettler is IJITEvents {
         }
     }
 
-    // A lower bound on the gas to load `dataLength` bytes, checked before loading anything, so a
-    // route far over the limit costs the caller almost nothing.
-    function _mayFit(uint256 dataLength, uint256 gasLimit) private pure returns (bool) {
-        return gasLimit == 0 || ((dataLength + 31) >> 5) * _MIN_LOAD_GAS_PER_WORD < gasLimit;
-    }
-
-    // Loads the route data and charges its gas to `gasLimit`. Returns the gas left for the
-    // executor, or 0 (no cap) when `gasLimit` is 0.
-    function _loadRoute(uint256 dataLength, uint256 gasLimit)
-        private
-        view
-        returns (bool fits, bytes memory data, uint256 executorGas)
-    {
-        if (!_mayFit(dataLength, gasLimit)) return (false, data, 0);
-        uint256 start = gasleft();
-        data = _loadRouteData(dataLength);
-        if (gasLimit == 0) return (true, data, 0);
-        uint256 used = start - gasleft();
-        if (used >= gasLimit) return (false, data, 0);
-        return (true, data, gasLimit - used);
-    }
-
     function _execute(
         RouteHeader memory header,
         bytes memory data,
@@ -252,16 +210,14 @@ contract JITSettler is IJITEvents {
         address tokenOut,
         uint256 amountIn,
         uint256 amountOutMin,
-        address recipient,
-        uint256 executorGas
+        address recipient
     ) private returns (uint256 amountOut) {
         _transferFrom(tokenIn, msg.sender, header.executor, amountIn);
         uint256 balanceBefore = IERC20(tokenOut).balanceOf(recipient);
         // Restore, not clear, so a swap nested inside an executor leaves the outer route visible.
         (address prevSetter, address prevCaller) = (_currentSetter, _currentCaller);
         (_currentSetter, _currentCaller) = (header.setter, msg.sender);
-        // A request for more gas than is left gets what is left, so 0 can mean no cap.
-        SANDBOX.run{ gas: executorGas == 0 ? gasleft() : executorGas }(header.executor, data);
+        SANDBOX.run(header.executor, data);
         (_currentSetter, _currentCaller) = (prevSetter, prevCaller);
         uint256 balanceAfter = IERC20(tokenOut).balanceOf(recipient);
         amountOut = balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0;
