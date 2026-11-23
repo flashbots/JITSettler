@@ -112,7 +112,7 @@ contract JITSettler is IJITEvents {
     ///         tokenIn fails, the executor reverts or has no code, or `recipient` gets less than
     ///         the floor. Call it in try/catch and run your default route on any revert; revert
     ///         data may come from the executor. The route gets all the gas the call has, so cap
-    ///         your own call.
+    ///         your own call if you run routes from setters you do not trust.
     /// @return amountOut What `recipient` received.
     function swap(Request calldata req, bool callback) external returns (uint256 amountOut) {
         (bool live, RouteHeader memory header) = _consumeRoute();

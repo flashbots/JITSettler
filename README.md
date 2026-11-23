@@ -28,7 +28,7 @@ from Gattaca's proof of concept,
 | `currentRoute()` | executor, venue | While a route runs, returns its setter and the caller of the swap; otherwise 0. |
 
 Below, `req` is the request `(tokenIn, tokenOut, amountIn, amountOutMin, recipient)`. The route
-gets all the gas the call to `swap` has, so the caller caps its own call (requirement 6).
+gets all the gas the call to `swap` has (requirement 6).
 
 `swap`:
 
@@ -63,8 +63,7 @@ caller checks.
 
 The executor is code the setter chose, running inside the caller's transaction. It can call back
 into the caller's contract, so every external function of the caller that changes state or moves
-tokens needs a re-entry guard. It can also use all the gas it gets, so the caller caps its call to
-the settler. The flows below show the guard.
+tokens needs a re-entry guard. It can also use all the gas it gets (requirement 6). The flows below show the guard.
 
 ### Integrating as a caller
 
@@ -79,7 +78,7 @@ still use flow A through generic call actions, if it can catch a revert and fall
 function execute(req, trustedSetters, defaultRoute) nonReentrant:
     s = settler.peek(req)                    // setter, or 0
     if s != 0 and s in trustedSetters:
-        try settler.swap{gas: cap}(req, false) -> out:  // the caller caps the route's gas
+        try settler.swap(req, false) -> out:
             return out
         catch:
             // fall through to the default
@@ -102,7 +101,7 @@ function execute(req, trustedSetters, defaultRoute) nonReentrant:
         try this.trialDefault(defaultRoute):     // always reverts
         catch (bytes err):
             if err is Measured(dOut):            // the default's output on the current state
-                try this.jitSwap{gas: cap}(req, dOut) -> out:
+                try this.jitSwap(req, dOut) -> out:
                     return out
                 catch:
                     // fall through to the default
@@ -144,7 +143,7 @@ flow B.
 
 ```
 function execute(req, trustedSetters, defaultRoute) nonReentrant:
-    try settler.swap{gas: cap}(req, true) -> out:
+    try settler.swap(req, true) -> out:
         return out
     catch:
         // no route, declined, or the route failed; fall through to the default
@@ -161,8 +160,7 @@ function routeAvailable(setter) -> floor:
 
 Set `req.amountOutMin` to the user's minimum. The callback can only raise the floor above it.
 The route's data is loaded only after the caller accepts, so declining a large route costs
-little. A decline reverts, so the route stays live for later callers. The gas cap on the call has
-to cover the callback as well as the route. If the callback posts a route itself, the call counts
+little. A decline reverts, so the route stays live for later callers. If the callback posts a route itself, the call counts
 as declined. Only set `callback` if your contract implements `routeAvailable`: a caller without
 it declines every route. A revert's data may come from the executor, so treat any revert as
 "fall back".
@@ -187,13 +185,15 @@ A builder can only route a caller's swaps if the caller follows these rules.
    `swap` measures it, so the two outputs compare.
 6. **Never fail the order on a JIT revert.** Call `swap` in `try`/`catch` and fall back on any
    revert. A route that was replaced, went stale or ran out of gas then costs a fall-back, not the
-   user's transaction. The route gets all the gas the call has, so cap your own call, for example
-   `settler.swap{gas: cap}(req, false)`. The cap bounds everything the route can cost you:
-   loading its data (about 2.1k gas per 32 bytes, size chosen by the setter), the transfer of
-   `tokenIn` (including any token hooks) and the executor. Builders read the gas your call gets
-   in simulation and treat it as the route's budget, so a cap also tells them which routes fit.
-   A caller that does not check setters must cap. Before the call, make sure the transaction has
-   gas for the cap, the default route and the report. If it does not, skip the JIT attempt.
+   user's transaction. The route gets all the gas the call has. If you check setters (flows A,
+   B and C above), you rely on the builder: it posts a route only when your whole transaction
+   succeeds with it in simulation, and it sizes routes from the gas your transaction has. Leave
+   headroom in the transaction's gas limit, because a route can use more gas than your default.
+   If you do not check setters, you must cap your own call, for example
+   `settler.swap{gas: cap}(req, false)`, and keep enough gas for your default route. Anyone can
+   post a route, and the cap is all that bounds what it costs you: loading its data (about 2.1k
+   gas per 32 bytes), the transfer of `tokenIn` (including any token hooks) and the executor.
+   Builders see a cap in simulation and only post routes that fit it.
 7. **Funded and approved.** When it calls `swap`, `msg.sender` holds `amountIn` of `tokenIn` and
    has approved the settler for it.
 8. **ERC-20 tokens only.** The settler uses `transferFrom` and `balanceOf`. Wrap or unwrap native
@@ -277,9 +277,10 @@ the callback's value.
   an arbitrary executor, a route could spend those approvals, for example by naming a token as the
   executor. A fixed selector would also stop that, barring a selector collision, but would limit
   executors to one function. The sandbox costs about 3.4k gas per routed swap.
-- **No gas limit in the request.** The route's data and code could use up the gas the caller
-  needs for its default. A cap on the caller's own call bounds all of it and is visible to
-  builders in simulation, so the request carries no separate gas field.
+- **No gas limit in the request.** A good value is hard for a caller to compute, and a
+  conservative one shuts out better routes. A builder only posts a route when the whole
+  transaction succeeds with it in simulation, and it sizes routes from the gas the transaction
+  has. A caller that runs routes from setters it does not trust caps its own call instead.
 - **Matching events.** `JITRoutedV1` and `JITDefaultV1` share the request fields, so routed and
   default outcomes compare directly. `JITRoutedV1` also names the caller, setter and executor.
 - **The floor is the caller's.** The settler cannot know what the default would have paid. A
