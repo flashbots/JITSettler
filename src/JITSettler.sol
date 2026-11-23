@@ -3,20 +3,16 @@ pragma solidity ^0.8.28;
 
 import { IERC20 } from "./IERC20.sol";
 
-/// @notice A swap request. Same field order and types as JITSettler v1.3.0, so `swap(Request)`
-///         keeps its selector.
+/// @notice A swap request.
 struct Request {
     address tokenIn;
     address tokenOut;
     uint256 amountIn;
     uint256 amountOutMin;
     address recipient;
-    /// @dev The most gas the caller gives the route, for builders to read. The settler does not
-    ///      enforce it; the caller caps its own call.
-    uint256 gasLimit;
 }
 
-/// @notice Events of the JIT settler standard. Both swap paths emit `JITRoutedV1` on a fill.
+/// @notice Events of the JIT settler standard. `swap` emits `JITRoutedV1` on a fill.
 ///         `reportDefault` emits `JITDefaultV1` for a caller that ran its own default route.
 interface IJITEvents {
     /// @notice A swap filled through a posted route. `caller` called the settler, `setter`
@@ -35,7 +31,7 @@ interface IJITEvents {
 
     /// @notice `reporter` ran its own default route. `amountOut` is what the recipient received
     ///         from it, as the reporter says. Builders count a report only when `reporter` is the
-    ///         contract that called `peek` or a swap function.
+    ///         contract that called `peek` or `swap`.
     event JITDefaultV1(
         address indexed reporter,
         address indexed tokenIn,
@@ -47,24 +43,19 @@ interface IJITEvents {
     );
 }
 
-/// @notice Implemented by callers of `swapWithCallback`.
+/// @notice Implemented by callers of `swap` with `callback` set.
 interface ISettlerCaller {
-    /// @notice Called by `swapWithCallback` when a route is live. Return the least `recipient`
-    ///         must receive to run it, or revert to decline it.
+    /// @notice Called by `swap` with `callback` set when a route is live. Return the least
+    ///         `recipient` must receive to run it, or revert to decline it. The floor is the larger
+    ///         of this and `req.amountOutMin`.
     function routeAvailable(address setter) external returns (uint256 amountOutMin);
 }
 
 /// @title JITSettler
-/// @notice Based on Gattaca's JIT settler PoC (gattaca-com/jit-settler-poc). Two ways to call it:
-///         `peek` + `swap` (the caller passes its floor and reverts on no route), or
-///         `swapWithCallback` (the settler asks the caller for its floor and returns the outcome).
+/// @notice Based on flashbots/JITSettler (swap-with-callback, ea9eecf), with its two swap paths
+///         merged into one `swap`. With `callback` set, the settler asks the caller whether to run
+///         the live route and for its floor. The floor is never below `req.amountOutMin`.
 contract JITSettler is IJITEvents {
-    enum Outcome {
-        NO_ROUTE,
-        ROUTE_DECLINED,
-        EXECUTED
-    }
-
     struct RouteHeader {
         address setter;
         uint64 timestamp;
@@ -83,11 +74,12 @@ contract JITSettler is IJITEvents {
     address private transient _currentSetter;
     address private transient _currentCaller;
 
-    // Counts `setRoute` calls in this transaction, so `swapWithCallback` can tell whether its
-    // callback overwrote the route data it has not loaded yet.
+    // Counts `setRoute` calls in this transaction, so `swap` can tell whether its callback
+    // overwrote the route data it has not loaded yet.
     uint256 private transient _routeWrites;
 
     error NoRoute();
+    error RouteDeclined();
     error TransferFailed();
     error InsufficientOutput(uint256 amountOut, uint256 amountOutMin);
 
@@ -111,47 +103,35 @@ contract JITSettler is IJITEvents {
         if (_isLive(header)) return header.setter;
     }
 
-    /// @notice Runs the live route for `req`. Reverts if there is none, if the route fails, or if
-    ///         `recipient` receives less than `req.amountOutMin`. Call it in try/catch with a gas
-    ///         cap, and fall back on any revert; revert data may come from the executor. The
-    ///         settler does not enforce `req.gasLimit`: the route gets all the gas the call has.
+    /// @notice Runs the live route for `req`, or reverts with `NoRoute` if there is none. With
+    ///         `callback`, the settler first calls `routeAvailable(setter)` on msg.sender, which
+    ///         returns its floor or reverts to decline, and `swap` then reverts with
+    ///         `RouteDeclined`. The floor is the larger of that and `req.amountOutMin`. The route's data is loaded only after the caller accepts, so
+    ///         declining a large route costs little. If the callback posts a route, the call counts
+    ///         as declined. Once a route runs, it reverts if the route fails: the transfer of
+    ///         tokenIn fails, the executor reverts or has no code, or `recipient` gets less than
+    ///         the floor. Call it in try/catch and run your default route on any revert; revert
+    ///         data may come from the executor. The route gets all the gas the call has, so cap
+    ///         your own call.
     /// @return amountOut What `recipient` received.
-    function swap(Request calldata req) external returns (uint256 amountOut) {
+    function swap(Request calldata req, bool callback) external returns (uint256 amountOut) {
         (bool live, RouteHeader memory header) = _consumeRoute();
         if (!live) revert NoRoute();
-        // Loaded before any external call, so a reentrant setRoute can't change it.
+        uint256 amountOutMin;
+        if (callback) {
+            uint256 writes = _routeWrites;
+            bool accepted;
+            (accepted, amountOutMin) = _askCaller(header.setter);
+            if (!accepted || _routeWrites != writes) revert RouteDeclined();
+        }
+        // The callback can raise the floor, never lower it.
+        if (amountOutMin < req.amountOutMin) amountOutMin = req.amountOutMin;
+        // Loaded after the callback but before any other external call, so a reentrant setRoute
+        // can't change it.
         bytes memory data = _loadRouteData(header.dataLength);
         return _execute(
-            header, data, req.tokenIn, req.tokenOut, req.amountIn, req.amountOutMin, req.recipient
+            header, data, req.tokenIn, req.tokenOut, req.amountIn, amountOutMin, req.recipient
         );
-    }
-
-    /// @notice Runs the live route if the caller accepts it. The settler calls
-    ///         `routeAvailable(setter)` on msg.sender, which returns its floor or reverts to
-    ///         decline. A declined route stays used, and its data is never loaded, so declining a
-    ///         large route costs little. If the callback posts a route, the call counts as
-    ///         declined. After the caller accepts, it reverts if the route fails: the transfer of
-    ///         tokenIn fails, the executor reverts or has no code, or `recipient` gets less than
-    ///         the floor. Treat any revert as a failed route; its data may come from the executor.
-    ///         The last argument is the request's gas limit, for builders to read. The settler
-    ///         does not enforce it: cap your own call.
-    /// @return outcome Whether the route ran. Unless `EXECUTED`, run your default route.
-    /// @return amountOut What `recipient` received if `EXECUTED`, else 0.
-    function swapWithCallback(
-        address tokenIn,
-        address tokenOut,
-        uint256 amountIn,
-        address recipient,
-        uint256 /* gasLimit */
-    ) external returns (Outcome outcome, uint256 amountOut) {
-        (bool live, RouteHeader memory header) = _consumeRoute();
-        if (!live) return (Outcome.NO_ROUTE, 0);
-        uint256 writes = _routeWrites;
-        (bool accepted, uint256 amountOutMin) = _askCaller(header.setter);
-        if (!accepted || _routeWrites != writes) return (Outcome.ROUTE_DECLINED, 0);
-        bytes memory data = _loadRouteData(header.dataLength);
-        amountOut = _execute(header, data, tokenIn, tokenOut, amountIn, amountOutMin, recipient);
-        return (Outcome.EXECUTED, amountOut);
     }
 
     /// @notice Emits `JITDefaultV1` for a caller that ran its own default route. Optional for
@@ -174,7 +154,7 @@ contract JITSettler is IJITEvents {
     /// @dev Lets a venue tell flow routed by a builder it trusts from other flow, for example to
     ///      quote a tighter spread, and lets an executor check who posted its route. A venue checks
     ///      `setter` against its own list, and optionally `caller` against known aggregators.
-    ///      Only the swap functions write these values.
+    ///      Only `swap` writes these values.
     function currentRoute() external view returns (address setter, address caller) {
         return (_currentSetter, _currentCaller);
     }

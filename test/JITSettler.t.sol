@@ -96,10 +96,10 @@ contract FlowACaller {
     ) external returns (uint256 out, bool routed) {
         tokenIn.approve(address(settler), amountIn);
         Request memory req =
-            Request(address(tokenIn), address(tokenOut), amountIn, minOut, recipient, G);
+            Request(address(tokenIn), address(tokenOut), amountIn, minOut, recipient);
         address s = settler.peek(req);
         if (s != address(0) && trusted[s]) {
-            try settler.swap(req) returns (uint256 o) {
+            try settler.swap(req, false) returns (uint256 o) {
                 return (o, true);
             } catch { }
         }
@@ -130,8 +130,8 @@ contract JITSettlerTest is Test, IJITEvents {
         tIn.approve(address(settler), type(uint256).max);
     }
 
-    function _req(uint256 minOut, uint256 gasLimit) internal view returns (Request memory) {
-        return Request(address(tIn), address(tOut), 1e18, minOut, recipient, gasLimit);
+    function _req(uint256 minOut, uint256) internal view returns (Request memory) {
+        return Request(address(tIn), address(tOut), 1e18, minOut, recipient);
     }
 
     function _data(uint256 gross, uint256 toUser, bytes memory trailing)
@@ -147,17 +147,11 @@ contract JITSettlerTest is Test, IJITEvents {
         settler.setRoute(address(exec), _data(gross, toUser, ""));
     }
 
-    /// v1.3.0 callers keep their selectors.
-    function test_selectors_matchV130() public pure {
-        assertEq(JITSettler.swap.selector, bytes4(0x56e87df9));
-        assertEq(JITSettler.peek.selector, bytes4(0x7c1c62dd));
-    }
-
     function test_noRoute_peekZero_swapReverts() public {
         assertEq(settler.peek(_req(1, G)), address(0));
         vm.prank(user);
         vm.expectRevert(JITSettler.NoRoute.selector);
-        settler.swap(_req(1, G));
+        settler.swap(_req(1, G), false);
     }
 
     /// The settler does not enforce gasLimit: the caller caps its own call. A route that burns all
@@ -168,18 +162,11 @@ contract JITSettlerTest is Test, IJITEvents {
         settler.setRoute(address(burner), abi.encodeCall(GasBurner.burn, ()));
         uint256 before = gasleft();
         vm.prank(user);
-        try settler.swap{ gas: 200_000 }(_req(1, 100_000)) {
+        try settler.swap{ gas: 200_000 }(_req(1, 100_000), false) {
             fail();
         } catch { }
         assertLt(before - gasleft(), 250_000);
         assertEq(settler.peek(_req(1, G)), builder);
-    }
-
-    /// gasLimit is not enforced: a route that needs more than it still fills.
-    function test_swap_gasLimitNotEnforced() public {
-        _post(110e18, 105e18);
-        vm.prank(user);
-        assertEq(settler.swap(_req(100e18, 1)), 105e18);
     }
 
     function test_routedFill_paysBuilderFee_emits() public {
@@ -199,7 +186,7 @@ contract JITSettlerTest is Test, IJITEvents {
             105e18
         );
         vm.prank(user);
-        uint256 out = settler.swap(_req(100e18, G));
+        uint256 out = settler.swap(_req(100e18, G), false);
 
         assertEq(out, 105e18);
         assertEq(tOut.balanceOf(builder), 5e18); // the builder's cut, taken in the executor
@@ -212,7 +199,7 @@ contract JITSettlerTest is Test, IJITEvents {
         vm.expectRevert(
             abi.encodeWithSelector(JITSettler.InsufficientOutput.selector, 99e18, 100e18)
         );
-        settler.swap(_req(100e18, G));
+        settler.swap(_req(100e18, G), false);
         // The revert undid the consumption.
         assertEq(settler.peek(_req(100e18, G)), builder);
     }
@@ -220,11 +207,11 @@ contract JITSettlerTest is Test, IJITEvents {
     function test_routeIsSingleUse() public {
         _post(110e18, 105e18);
         vm.prank(user);
-        settler.swap(_req(100e18, G));
+        settler.swap(_req(100e18, G), false);
         assertEq(settler.peek(_req(100e18, G)), address(0));
         vm.prank(user);
         vm.expectRevert(JITSettler.NoRoute.selector);
-        settler.swap(_req(100e18, G));
+        settler.swap(_req(100e18, G), false);
     }
 
     function test_routeExpiresNextBlock() public {
@@ -247,7 +234,7 @@ contract JITSettlerTest is Test, IJITEvents {
         vm.prank(builder);
         settler.setRoute(address(exec), _data(110e18, 105e18, sig));
         vm.prank(user);
-        assertEq(settler.swap(_req(100e18, G)), 105e18);
+        assertEq(settler.swap(_req(100e18, G), false), 105e18);
     }
 
     /// An "executor" that is the token itself cannot spend allowances given to the settler: the
@@ -264,7 +251,7 @@ contract JITSettlerTest is Test, IJITEvents {
         );
         vm.prank(user);
         vm.expectRevert(); // allowance[victim][sandbox] == 0
-        settler.swap(_req(0, G));
+        settler.swap(_req(0, G), false);
         assertEq(tIn.balanceOf(victim), 50e18);
     }
 
@@ -280,7 +267,7 @@ contract JITSettlerTest is Test, IJITEvents {
         settler.setRoute(makeAddr("eoa"), hex"12345678");
         vm.prank(user);
         vm.expectRevert();
-        settler.swap(_req(0, G));
+        settler.swap(_req(0, G), false);
         assertEq(tIn.balanceOf(user), 1000e18);
     }
 
@@ -290,7 +277,7 @@ contract JITSettlerTest is Test, IJITEvents {
         vm.prank(builder);
         settler.setRoute(address(big), abi.encodeCall(BigReverter.boom, (200_000)));
         vm.prank(user);
-        try settler.swap(_req(0, 5_000_000)) {
+        try settler.swap(_req(0, 5_000_000), false) {
             fail();
         } catch (bytes memory err) {
             assertEq(err.length, 0x104);
